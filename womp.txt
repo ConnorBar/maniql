@@ -1,0 +1,44 @@
+x11vnc \
+  -display :1 \
+  -auth /run/user/$(id -u)/gdm/Xauthority \
+  -rfbauth ~/.vnc/passwd \
+  -forever \
+  -shared \
+  -noxdamage \
+  -repeat 
+
+
+
+python visualize_transitions.py \
+  --input data/2026-02-10-13-50-16_transitions.pkl \
+  --output bulb_task_wrist_taxim.mp4 \
+  --fps 20
+
+
+conda deactivate
+conda remove -y -n tacsl --all
+conda create -y -n tacsl python=3.8 numpy "imageio<3" pillow
+conda activate tacsl
+pip install imageio[ffmeg]
+pip install matplotlib  # if you need it elsewhere
+
+cd ~/cap/manifeel-isaacgymenvs
+pip install -e .
+
+
+
+need numpy 1.24< for manifeel
+
+need cv2
+conda install conda-forge::opencv
+conda install conda-forge::wandb
+
+ffmpeg -i input.webm -vn -ab 128k -ar 44100 -y output.mp3
+
+python train.py task=Cartpole \
+  wandb.entity=cbarnsle-purdue-university \
+  wandb.project=isaacgym-cartpole
+
+export WANDB_ENTITY=cbarnsle-purdue-university
+export WANDB_PROJECT=isaacgym-cartpole
+python train.py task=Cartpole

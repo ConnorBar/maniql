@@ -1,0 +1,25 @@
+
+*.mp4
+*.pkl
+*.npz
+*.flax
+__pycache__/
+_pkgs/
+
+*.ipynb
+
+
+
+checkpoints/
+*.pth
+*.pkl
+*.h5
+*.onnx
+
+# TensorBoard logs
+events.out.tfevents.*
+
+runs/
+data/
+IsaacGym_Preview_TacSL_Package/
+manifeel-isaacgymenvs/

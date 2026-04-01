@@ -1,0 +1,9 @@
+name: tacsl
+channels:
+  - defaults
+dependencies:
+  - pillow
+  - numpy=1.23.5
+  - python=3.8.20
+  - imageio[version='<3']
+  - opencv
