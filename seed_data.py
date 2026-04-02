@@ -10,6 +10,8 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 from tqdm import tqdm
 
+from obs_modality import SPLIT_KEYS
+
 # Avoid OpenMP shared-memory init failures in restricted environments.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -68,6 +70,15 @@ def parse_args():
         help="Keep chunk files after successful merge.",
     )
     return parser.parse_args()
+
+
+# Stored as (H, W, C); must match multimodal_nets.TactileEncoder input.
+TACTILE_HWC = (160, 120, 3)
+
+
+def multimodal_split_storage(selected_features: Sequence[str]) -> bool:
+    """When all four modalities are selected, write split arrays (no flat concat)."""
+    return set(selected_features) == {"wrist", "tactile", "forcefield", "state"}
 
 
 def parse_features(features: str) -> List[str]:
@@ -222,6 +233,37 @@ def flatten_obs_transition(
 
     return np.concatenate(obs_parts, axis=0), np.concatenate(next_parts, axis=0)
 
+
+def passthrough_vectors_for_transition(
+    tr: Dict,
+    i: int,
+    selected_features: Sequence[str],
+    wrist_obs_encoded: np.ndarray,
+    wrist_next_obs_encoded: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Wrist + state only, in the same order as ``selected_features``."""
+    obs_parts, next_parts = [], []
+    for feat in selected_features:
+        if feat == "wrist":
+            obs_parts.append(np.asarray(wrist_obs_encoded[i], dtype=np.float32).reshape(-1))
+            next_parts.append(np.asarray(wrist_next_obs_encoded[i], dtype=np.float32).reshape(-1))
+        elif feat == "state":
+            obs_parts.append(_squeeze_to_float32(tr["obs"]["state"]).reshape(-1))
+            next_parts.append(_squeeze_to_float32(tr["next_obs"]["state"]).reshape(-1))
+    return np.concatenate(obs_parts, axis=0), np.concatenate(next_parts, axis=0)
+
+
+def tactile_volume(tr: Dict, *, next: bool = False) -> np.ndarray:
+    key = "next_obs" if next else "obs"
+    flat = _squeeze_to_float32(tr[key]["right_tactile_camera_taxim"]).reshape(-1)
+    return flat.reshape(TACTILE_HWC).astype(np.float32, copy=False)
+
+
+def forcefield_vector(tr: Dict, *, next: bool = False) -> np.ndarray:
+    key = "next_obs" if next else "obs"
+    return _squeeze_to_float32(tr[key]["tactile_force_field_right"]).reshape(-1).astype(np.float32)
+
+
 ######################################################
 # -------------- PREPROCESSING FILE TO ARRAYS -------------- #
 ######################################################
@@ -268,9 +310,17 @@ def preprocess_file_to_arrays(
         wrist_obs_encoded = encode_wrist_images(wrist_model, wrist_encoder_name, wrist_obs, batch_size, device_str)
         wrist_next_obs_encoded = encode_wrist_images(wrist_model, wrist_encoder_name, wrist_next_obs, batch_size, device_str)
 
-    # ----- flattening observations -----
+    split_mode = multimodal_split_storage(selected_features)
+
+    # ----- observations -----
     obs_rows = []
     next_obs_rows = []
+    passthrough_rows = []
+    next_passthrough_rows = []
+    tactile_rows = []
+    next_tactile_rows = []
+    force_rows = []
+    next_force_rows = []
     actions = []
     rewards = []
     dones = []
@@ -280,9 +330,20 @@ def preprocess_file_to_arrays(
     source_files = []
 
     for i, tr in enumerate(transitions):
-        obs_vec, next_obs_vec = flatten_obs_transition(tr, i, selected_features, wrist_obs_encoded, wrist_next_obs_encoded)
-        obs_rows.append(obs_vec.astype(np.float32))
-        next_obs_rows.append(next_obs_vec.astype(np.float32))
+        if split_mode:
+            pv, npv = passthrough_vectors_for_transition(
+                tr, i, selected_features, wrist_obs_encoded, wrist_next_obs_encoded)
+            passthrough_rows.append(pv.astype(np.float32))
+            next_passthrough_rows.append(npv.astype(np.float32))
+            tactile_rows.append(tactile_volume(tr, next=False))
+            next_tactile_rows.append(tactile_volume(tr, next=True))
+            force_rows.append(forcefield_vector(tr, next=False))
+            next_force_rows.append(forcefield_vector(tr, next=True))
+        else:
+            obs_vec, next_obs_vec = flatten_obs_transition(
+                tr, i, selected_features, wrist_obs_encoded, wrist_next_obs_encoded)
+            obs_rows.append(obs_vec.astype(np.float32))
+            next_obs_rows.append(next_obs_vec.astype(np.float32))
         actions.append(_squeeze_to_float32(tr["action"]).reshape(-1))
         rewards.append(float(np.asarray(tr["reward"]).reshape(-1)[0]))         # very small rewards
         dones.append(float(bool(np.asarray(tr["done"]).reshape(-1)[0])))       # NOTE assuming is the correct flag for success
@@ -293,6 +354,27 @@ def preprocess_file_to_arrays(
 
     # ----- returning the arrays -----
     # NOTE that we are going to treat DONE as the success flag for IQL.
+    if split_mode:
+        k_pass, k_tact, k_ff = SPLIT_KEYS
+        return {
+            "obs": {
+                k_pass: np.stack(passthrough_rows, axis=0).astype(np.float32),
+                k_tact: np.stack(tactile_rows, axis=0).astype(np.float32),
+                k_ff: np.stack(force_rows, axis=0).astype(np.float32),
+            },
+            "next_obs": {
+                k_pass: np.stack(next_passthrough_rows, axis=0).astype(np.float32),
+                k_tact: np.stack(next_tactile_rows, axis=0).astype(np.float32),
+                k_ff: np.stack(next_force_rows, axis=0).astype(np.float32),
+            },
+            "actions": np.stack(actions, axis=0).astype(np.float32),
+            "rewards": np.asarray(rewards, dtype=np.float32),
+            "dones": np.asarray(dones, dtype=np.float32),
+            "success": np.asarray(success, dtype=np.float32),
+            "timeouts": np.asarray(timeouts, dtype=np.float32),
+            "seed": np.asarray(seeds, dtype=np.int32),
+            "source_file": np.asarray(source_files, dtype=object),
+        }
     return {
         "obs": np.stack(obs_rows, axis=0).astype(np.float32),
         "next_obs": np.stack(next_obs_rows, axis=0).astype(np.float32),
@@ -338,22 +420,46 @@ def build_obs_layout(selected_features: Sequence[str], sample_tr: Dict, sample_o
 # ------------ FLUSHING CHUNKS TO FILES ------------ #
 ######################################################
 
-def flush_chunk(chunk_idx: int, chunk_dir: Path, file_records: List[Dict], buffers: Dict[str, List[np.ndarray]]):
-    if len(buffers["obs"]) == 0:
+def flush_chunk(chunk_idx: int, chunk_dir: Path, file_records: List[Dict], buffers: Dict):
+    is_split = isinstance(buffers.get("obs"), dict)
+    if is_split:
+        if len(buffers["obs"][SPLIT_KEYS[0]]) == 0:
+            return
+    elif len(buffers["obs"]) == 0:
         return
     chunk_path = chunk_dir / f"chunk_{chunk_idx:05d}.pkl"
-    payload = {
-        "obs": np.concatenate(buffers["obs"], axis=0).astype(np.float32),
-        "next_obs": np.concatenate(buffers["next_obs"], axis=0).astype(np.float32),
-        "actions": np.concatenate(buffers["actions"], axis=0).astype(np.float32),
-        "rewards": np.concatenate(buffers["rewards"], axis=0).astype(np.float32),
-        "dones": np.concatenate(buffers["dones"], axis=0).astype(np.float32),
-        "success": np.concatenate(buffers["success"], axis=0).astype(np.float32),
-        "timeouts": np.concatenate(buffers["timeouts"], axis=0).astype(np.float32),
-        "seed": np.concatenate(buffers["seed"], axis=0).astype(np.int32),
-        "source_file": np.concatenate(buffers["source_file"], axis=0),
-        "file_records": file_records,
-    }
+    if is_split:
+        payload = {
+            "obs": {
+                k: np.concatenate(buffers["obs"][k], axis=0).astype(np.float32)
+                for k in SPLIT_KEYS
+            },
+            "next_obs": {
+                k: np.concatenate(buffers["next_obs"][k], axis=0).astype(np.float32)
+                for k in SPLIT_KEYS
+            },
+            "actions": np.concatenate(buffers["actions"], axis=0).astype(np.float32),
+            "rewards": np.concatenate(buffers["rewards"], axis=0).astype(np.float32),
+            "dones": np.concatenate(buffers["dones"], axis=0).astype(np.float32),
+            "success": np.concatenate(buffers["success"], axis=0).astype(np.float32),
+            "timeouts": np.concatenate(buffers["timeouts"], axis=0).astype(np.float32),
+            "seed": np.concatenate(buffers["seed"], axis=0).astype(np.int32),
+            "source_file": np.concatenate(buffers["source_file"], axis=0),
+            "file_records": file_records,
+        }
+    else:
+        payload = {
+            "obs": np.concatenate(buffers["obs"], axis=0).astype(np.float32),
+            "next_obs": np.concatenate(buffers["next_obs"], axis=0).astype(np.float32),
+            "actions": np.concatenate(buffers["actions"], axis=0).astype(np.float32),
+            "rewards": np.concatenate(buffers["rewards"], axis=0).astype(np.float32),
+            "dones": np.concatenate(buffers["dones"], axis=0).astype(np.float32),
+            "success": np.concatenate(buffers["success"], axis=0).astype(np.float32),
+            "timeouts": np.concatenate(buffers["timeouts"], axis=0).astype(np.float32),
+            "seed": np.concatenate(buffers["seed"], axis=0).astype(np.int32),
+            "source_file": np.concatenate(buffers["source_file"], axis=0),
+            "file_records": file_records,
+        }
     with open(chunk_path, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -367,23 +473,25 @@ def merge_chunks_to_final(chunk_dir: Path, output_path: Path, metadata: Dict):
     if not chunk_files:
         raise RuntimeError(f"No chunk files found in {chunk_dir}")
 
-    total = 0
-    obs_dim = None
-    act_dim = None
+    with open(chunk_files[0], "rb") as f:
+        first = pickle.load(f)
+    split = isinstance(first.get("obs"), dict) and SPLIT_KEYS[0] in first["obs"]
+
     all_file_records = []
+    total = 0
+    act_dim = None
 
     for chunk_file in chunk_files:
         with open(chunk_file, "rb") as f:
             chunk = pickle.load(f)
-        total += int(chunk["obs"].shape[0])
-        obs_dim = int(chunk["obs"].shape[1]) if obs_dim is None else obs_dim
+        n = int(chunk["actions"].shape[0])
+        total += n
         act_dim = int(chunk["actions"].shape[1]) if act_dim is None else act_dim
         all_file_records.extend(chunk["file_records"])
 
     tmp_dir = output_path.parent / f".{output_path.stem}_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    obs_mm = np.memmap(tmp_dir / "obs.dat", dtype=np.float32, mode="w+", shape=(total, obs_dim))
-    next_obs_mm = np.memmap(tmp_dir / "next_obs.dat", dtype=np.float32, mode="w+", shape=(total, obs_dim))
+
     actions_mm = np.memmap(tmp_dir / "actions.dat", dtype=np.float32, mode="w+", shape=(total, act_dim))
     rewards_mm = np.memmap(tmp_dir / "rewards.dat", dtype=np.float32, mode="w+", shape=(total,))
     dones_mm = np.memmap(tmp_dir / "dones.dat", dtype=np.float32, mode="w+", shape=(total,))
@@ -391,6 +499,90 @@ def merge_chunks_to_final(chunk_dir: Path, output_path: Path, metadata: Dict):
     timeouts_mm = np.memmap(tmp_dir / "timeouts.dat", dtype=np.float32, mode="w+", shape=(total,))
     seed_mm = np.memmap(tmp_dir / "seed.dat", dtype=np.int32, mode="w+", shape=(total,))
     source_file_arr = np.empty((total,), dtype=object)
+
+    if split:
+        k_pass, k_tact, k_ff = SPLIT_KEYS
+        ptp_dim = int(first["obs"][k_pass].shape[1])
+        tac_shape = tuple(int(x) for x in first["obs"][k_tact].shape[1:])
+        ff_dim = int(first["obs"][k_ff].shape[1])
+        obs_ptp_mm = np.memmap(tmp_dir / "obs_pass.dat", dtype=np.float32, mode="w+", shape=(total, ptp_dim))
+        obs_tac_mm = np.memmap(
+            tmp_dir / "obs_tact.dat", dtype=np.float32, mode="w+", shape=(total, *tac_shape))
+        obs_ff_mm = np.memmap(tmp_dir / "obs_forcefield.dat", dtype=np.float32, mode="w+", shape=(total, ff_dim))
+        nptp_mm = np.memmap(tmp_dir / "next_obs_pass.dat", dtype=np.float32, mode="w+", shape=(total, ptp_dim))
+        ntac_mm = np.memmap(
+            tmp_dir / "next_obs_tact.dat", dtype=np.float32, mode="w+", shape=(total, *tac_shape))
+        nff_mm = np.memmap(tmp_dir / "next_obs_forcefield.dat", dtype=np.float32, mode="w+", shape=(total, ff_dim))
+
+        cursor = 0
+        for chunk_file in tqdm(chunk_files, desc="Merging chunks"):
+            with open(chunk_file, "rb") as f:
+                chunk = pickle.load(f)
+            n = int(chunk["actions"].shape[0])
+            sl = slice(cursor, cursor + n)
+            obs_ptp_mm[sl] = chunk["obs"][k_pass]
+            obs_tac_mm[sl] = chunk["obs"][k_tact]
+            obs_ff_mm[sl] = chunk["obs"][k_ff]
+            nptp_mm[sl] = chunk["next_obs"][k_pass]
+            ntac_mm[sl] = chunk["next_obs"][k_tact]
+            nff_mm[sl] = chunk["next_obs"][k_ff]
+            actions_mm[sl] = chunk["actions"]
+            rewards_mm[sl] = chunk["rewards"]
+            dones_mm[sl] = chunk["dones"]
+            success_mm[sl] = chunk["success"]
+            timeouts_mm[sl] = chunk["timeouts"]
+            seed_mm[sl] = chunk["seed"]
+            source_file_arr[sl] = chunk["source_file"]
+            cursor += n
+
+        file_index = []
+        run_start = 0
+        for rec in all_file_records:
+            n_tr = int(rec["num_transitions"])
+            file_index.append(
+                {
+                    "source_file": rec["source_file"],
+                    "seed": int(rec["seed"]),
+                    "num_transitions": n_tr,
+                    "start_idx": run_start,
+                    "end_idx_exclusive": run_start + n_tr,
+                }
+            )
+            run_start += n_tr
+
+        final_payload = {
+            "metadata": metadata,
+            "file_index": file_index,
+            "obs": {
+                k_pass: np.asarray(obs_ptp_mm),
+                k_tact: np.asarray(obs_tac_mm),
+                k_ff: np.asarray(obs_ff_mm),
+            },
+            "next_obs": {
+                k_pass: np.asarray(nptp_mm),
+                k_tact: np.asarray(ntac_mm),
+                k_ff: np.asarray(nff_mm),
+            },
+            "actions": np.asarray(actions_mm),
+            "rewards": np.asarray(rewards_mm),
+            "dones": np.asarray(dones_mm),
+            "terminals": np.clip(np.asarray(dones_mm) - np.asarray(timeouts_mm), 0.0, 1.0).astype(np.float32),
+            "success": np.asarray(success_mm),
+            "timeouts": np.asarray(timeouts_mm),
+            "seed": np.asarray(seed_mm),
+            "source_file": source_file_arr,
+        }
+        with open(output_path, "wb") as f:
+            pickle.dump(final_payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        del (obs_ptp_mm, obs_tac_mm, obs_ff_mm, nptp_mm, ntac_mm, nff_mm)
+        del actions_mm, rewards_mm, dones_mm, success_mm, timeouts_mm, seed_mm
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
+
+    obs_dim = int(first["obs"].shape[1])
+    obs_mm = np.memmap(tmp_dir / "obs.dat", dtype=np.float32, mode="w+", shape=(total, obs_dim))
+    next_obs_mm = np.memmap(tmp_dir / "next_obs.dat", dtype=np.float32, mode="w+", shape=(total, obs_dim))
 
     cursor = 0
     for chunk_file in tqdm(chunk_files, desc="Merging chunks"):
@@ -488,9 +680,18 @@ def main():
         sample_emb = np.array([], dtype=np.float32)
     # ----- building observation layout based on the first file -----
     obs_layout = build_obs_layout(selected_features, first_tr, sample_emb)
+    use_split = multimodal_split_storage(selected_features)
 
     # ----- initializing buffers for chunking -----
-    buffers = {k: [] for k in ["obs", "next_obs", "actions", "rewards", "dones", "success", "timeouts", "seed", "source_file"]}
+    scalar_buffer_keys = ["actions", "rewards", "dones", "success", "timeouts", "seed", "source_file"]
+    if use_split:
+        buffers = {
+            "obs": {k: [] for k in SPLIT_KEYS},
+            "next_obs": {k: [] for k in SPLIT_KEYS},
+            **{k: [] for k in scalar_buffer_keys},
+        }
+    else:
+        buffers = {k: [] for k in (["obs", "next_obs"] + scalar_buffer_keys)}
     chunk_idx = 0
     files_in_chunk = 0
     file_records = [] # used for metadata and bookkeeping
@@ -510,17 +711,25 @@ def main():
             assigned_seed=assigned_seed,
         )
 
-        for k in buffers:
-            buffers[k].append(arrs[k])
+        if use_split:
+            for k in SPLIT_KEYS:
+                buffers["obs"][k].append(arrs["obs"][k])
+                buffers["next_obs"][k].append(arrs["next_obs"][k])
+            for k in scalar_buffer_keys:
+                buffers[k].append(arrs[k])
+        else:
+            for k in buffers:
+                buffers[k].append(arrs[k])
         # ----- appending file records -----
+        n_here = int(arrs["obs"][SPLIT_KEYS[0]].shape[0]) if use_split else int(arrs["obs"].shape[0])
         file_records.append(
             {
                 "source_file": file_path.name,
                 "seed": assigned_seed,
-                "num_transitions": int(arrs["obs"].shape[0]),
+                "num_transitions": n_here,
             }
         )
-        total_transitions += int(arrs["obs"].shape[0])
+        total_transitions += n_here
         files_in_chunk += 1
 
         # ----- flush buffers to file -----
@@ -529,7 +738,14 @@ def main():
             chunk_idx += 1
             files_in_chunk = 0
             file_records = []
-            buffers = {k: [] for k in buffers}
+            if use_split:
+                buffers = {
+                    "obs": {k: [] for k in SPLIT_KEYS},
+                    "next_obs": {k: [] for k in SPLIT_KEYS},
+                    **{k: [] for k in scalar_buffer_keys},
+                }
+            else:
+                buffers = {k: [] for k in (["obs", "next_obs"] + scalar_buffer_keys)}
 
     # ----- flush any remaining chunks -----
     if files_in_chunk > 0:
@@ -542,11 +758,19 @@ def main():
         "num_transitions": total_transitions,
         "selected_features": selected_features,
         "obs_layout": obs_layout,
+        "modality_storage": "split" if use_split else "concat",
         "wrist_encoder": args.wrist_encoder if "wrist" in selected_features else None,
         "wrist_model": args.wrist_model if ("wrist" in selected_features and args.wrist_encoder != "raw") else None,
         "seed_start": int(args.seed_start),
         "file_sort": "filename ascending",
     }
+    if use_split:
+        metadata["obs_modality_spec"] = {
+            "passthrough_order": [f for f in selected_features if f in ("wrist", "state")],
+            "tactile_shape": list(TACTILE_HWC),
+            "forcefield_dim": int(
+                _squeeze_to_float32(first_tr["obs"]["tactile_force_field_right"]).reshape(-1).shape[0]),
+        }
     merge_chunks_to_final(chunk_dir, output_path, metadata)
 
     if not args.keep_chunks:

@@ -1,17 +1,23 @@
 """Offline IQL training on ManiFeel preprocessed datasets.
 
-Usage:
+Usage (unimodal, wrist+state only):
     python train_iql.py \
         --dataset_path data/preprocessed/all_transitions_r3m_wrist_state.pkl \
-        --save_dir runs/manifeel_iql_wrist_state_clean \
-        --max_steps 200000 \
-        --test_ratio 0.1 \
-        --eval_interval 2000
+        --save_dir runs/manifeel_iql_wrist_state \
+        --max_steps 200000
+
+Usage (multi-modal, all modalities with CNN/MLP encoders):
+    python train_iql.py \
+        --dataset_path data/preprocessed/all_transitions_r3m_wrist_tactile_force_state.pkl \
+        --multimodal \
+        --save_dir runs/manifeel_iql_multimodal \
+        --max_steps 200000
 """
 
 import os
 import sys
 
+# gets access to critic and learner modules
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "implicit_q_learning"))
 
 import jax
@@ -25,6 +31,7 @@ from tensorboardX import SummaryWriter
 from critic import loss as expectile_loss
 from learner import Learner
 from manifeel_iql import ManiFeelDataset
+from multimodal_nets import MultiModalLearner, FULL_OBS_DIM # TODO: the obs dim likely needs to be hyperparameterized
 
 FLAGS = flags.FLAGS
 
@@ -44,7 +51,13 @@ flags.DEFINE_boolean("validate", True, "Run data sanity checks before training."
 flags.DEFINE_string(
     "use_features", None,
     "Comma-separated feature subset to use from obs_layout, e.g. 'wrist,state'. "
-    "If unset, uses the full observation vector."
+    "If unset, uses the full observation vector.  Ignored when --multimodal."
+)
+flags.DEFINE_boolean(
+    "multimodal", False,
+    "Use multi-modal IQL with CNN (tactile) and MLP (forcefield) encoders "
+    "trained end-to-end.  Requires a dataset preprocessed with all four "
+    "features (wrist, tactile, forcefield, state)."
 )
 
 config_flags.DEFINE_config_file(
@@ -136,7 +149,7 @@ def normalize_rewards(dataset: ManiFeelDataset):
     print(f"[INFO] Rewards normalized: range {ret_range:.4f} -> scaled to 1000.")
 
 
-def save_checkpoint(agent: Learner, save_dir: str, step: int):
+def save_checkpoint(agent, save_dir: str, step: int):
     ckpt_dir = os.path.join(save_dir, f"checkpoint_{step}")
     os.makedirs(ckpt_dir, exist_ok=True)
     agent.actor.save(os.path.join(ckpt_dir, "actor.flax"))
@@ -156,7 +169,9 @@ def main(_):
     np.random.seed(FLAGS.seed)
 
     use_features = None
-    if FLAGS.use_features:
+    if FLAGS.multimodal:
+        use_features = None  # need full obs for the multi-modal encoders
+    elif FLAGS.use_features:
         use_features = [f.strip() for f in FLAGS.use_features.split(",") if f.strip()]
 
     full_dataset = ManiFeelDataset(
@@ -164,6 +179,21 @@ def main(_):
         use_features=use_features,
         clip_actions=FLAGS.clip_actions,
     )
+
+    if FLAGS.multimodal:
+        if full_dataset.modality_storage == "split":
+            pass
+        elif (
+            full_dataset.observations is not None
+            and full_dataset.observations.shape[1] == FULL_OBS_DIM
+        ):
+            pass  # legacy single-vector concat format
+        else:
+            raise ValueError(
+                "--multimodal needs either modality-split data (re-run seed_data with "
+                "wrist,tactile,forcefield,state) or a flat obs of dim "
+                f"{FULL_OBS_DIM}."
+            )
 
     # Episode-level train/test split
     train_ds, test_ds = full_dataset.train_test_split(
@@ -187,15 +217,17 @@ def main(_):
         normalize_rewards(test_ds)
 
     kwargs = dict(FLAGS.config)
-    agent = Learner(
+    LearnerCls = MultiModalLearner if FLAGS.multimodal else Learner
+    agent = LearnerCls(
         FLAGS.seed,
-        train_ds.observations[:1],
+        train_ds.observation_example(),
         train_ds.actions[:1],
         max_steps=FLAGS.max_steps,
         **kwargs,
     )
 
-    print(f"[START] Training IQL for {FLAGS.max_steps:,} steps "
+    mode_str = "multi-modal (CNN+MLP encoders)" if FLAGS.multimodal else "unimodal"
+    print(f"[START] Training IQL ({mode_str}) for {FLAGS.max_steps:,} steps "
           f"(batch={FLAGS.batch_size}, train={train_ds.size:,}, test={test_ds.size:,})")
 
     for i in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm):

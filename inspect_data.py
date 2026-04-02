@@ -134,20 +134,37 @@ def inspect_preprocessed(pkl_path: str):
         for k, v in md.items():
             print(f"  {k}: {v}")
 
-    for key in ["obs", "next_obs", "actions", "rewards", "dones", "terminals", "success", "timeouts"]:
-        if key in data:
-            arr = np.asarray(data[key])
-            print(f"\n{key}:")
-            print(f"  shape: {arr.shape}  dtype: {arr.dtype}")
+    if "obs" in data and isinstance(data["obs"], dict):
+        print(f"\nobs (split dict) keys: {list(data['obs'].keys())}")
+        for subk, arr in data["obs"].items():
+            arr = np.asarray(arr)
+            print(f"\n  obs['{subk}']:")
+            print(f"    shape: {arr.shape}  dtype: {arr.dtype}")
             if arr.dtype in (np.float32, np.float64, np.int32, np.int64):
-                print(f"  min: {arr.min():.6f}  max: {arr.max():.6f}  mean: {arr.mean():.6f}")
-                if arr.ndim == 1:
-                    n_nonzero = np.count_nonzero(arr)
-                    print(f"  nonzero: {n_nonzero} / {len(arr)} ({n_nonzero/len(arr):.2%})")
+                print(f"    min: {arr.min():.6f}  max: {arr.max():.6f}  mean: {arr.mean():.6f}")
                 if np.any(np.isnan(arr)):
-                    print(f"  WARNING: {np.isnan(arr).sum()} NaN values!")
-                if np.any(np.isinf(arr)):
-                    print(f"  WARNING: {np.isinf(arr).sum()} Inf values!")
+                    print(f"    WARNING: {np.isnan(arr).sum()} NaN values!")
+        print(f"\nnext_obs (split dict) keys: {list(data['next_obs'].keys())}")
+        for subk, arr in data["next_obs"].items():
+            arr = np.asarray(arr)
+            print(f"\n  next_obs['{subk}']:")
+            print(f"    shape: {arr.shape}  dtype: {arr.dtype}")
+
+    for key in ["obs", "next_obs", "actions", "rewards", "dones", "terminals", "success", "timeouts"]:
+        if key not in data or key in ("obs", "next_obs") and isinstance(data.get(key), dict):
+            continue
+        arr = np.asarray(data[key])
+        print(f"\n{key}:")
+        print(f"  shape: {arr.shape}  dtype: {arr.dtype}")
+        if arr.dtype in (np.float32, np.float64, np.int32, np.int64):
+            print(f"  min: {arr.min():.6f}  max: {arr.max():.6f}  mean: {arr.mean():.6f}")
+            if arr.ndim == 1:
+                n_nonzero = np.count_nonzero(arr)
+                print(f"  nonzero: {n_nonzero} / {len(arr)} ({n_nonzero/len(arr):.2%})")
+            if np.any(np.isnan(arr)):
+                print(f"  WARNING: {np.isnan(arr).sum()} NaN values!")
+            if np.any(np.isinf(arr)):
+                print(f"  WARNING: {np.isinf(arr).sum()} Inf values!")
 
 
 if __name__ == "__main__":
