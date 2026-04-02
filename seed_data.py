@@ -86,6 +86,33 @@ def try_append_repo_path(repo_path: str):
     if p not in sys.path:
         sys.path.append(p)
 
+
+def _import_attr(module_name: str, attr_name: str, repo_path: str = ""):
+    """Import an attribute from module, retrying after repo path injection."""
+    try:
+        mod = importlib.import_module(module_name)
+        if hasattr(mod, attr_name):
+            return getattr(mod, attr_name)
+    except Exception:
+        pass
+
+    if repo_path:
+        try_append_repo_path(repo_path)
+
+    # Force a clean re-import in case an unrelated module was cached.
+    importlib.invalidate_caches()
+    for k in list(sys.modules.keys()):
+        if k == module_name or k.startswith(f"{module_name}."):
+            del sys.modules[k]
+
+    mod = importlib.import_module(module_name)
+    if not hasattr(mod, attr_name):
+        raise AttributeError(
+            f"Module '{module_name}' does not expose '{attr_name}'. "
+            f"Loaded from: {getattr(mod, '__file__', 'unknown')}"
+        )
+    return getattr(mod, attr_name)
+
 ######################################################
 # -------------- R3M and VIP loading -------------- #
 ######################################################
@@ -97,18 +124,10 @@ def load_wrist_encoder(encoder_name: str, model_name: str, r3m_repo: str, vip_re
     import torch
 
     if encoder_name == "r3m":
-        try:
-            load_r3m = importlib.import_module("r3m").load_r3m
-        except Exception:
-            try_append_repo_path(r3m_repo)
-            load_r3m = importlib.import_module("r3m").load_r3m
+        load_r3m = _import_attr("r3m", "load_r3m", repo_path=r3m_repo)
         model = load_r3m(model_name)
     else:
-        try:
-            load_vip = importlib.import_module("vip").load_vip
-        except Exception:
-            try_append_repo_path(vip_repo)
-            load_vip = importlib.import_module("vip").load_vip
+        load_vip = _import_attr("vip", "load_vip", repo_path=vip_repo)
         model = load_vip(model_name)
 
     device = torch.device(device_str)

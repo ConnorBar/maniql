@@ -50,10 +50,8 @@ class ManiFeelDataset:
             lim = 1.0 - eps
             actions = np.clip(actions, -lim, lim)
 
-        # Feature selection via obs_layout
         obs, next_obs = self._select_features(obs, next_obs, use_features)
 
-        # done = success (expert data). Terminal -> zero out bootstrap.
         terminals = dones.astype(np.float32)
         masks = (1.0 - terminals).astype(np.float32)
 
@@ -65,6 +63,71 @@ class ManiFeelDataset:
         self.dones_float = dones.copy()
         self.terminals = terminals
         self.size = len(obs)
+
+    @classmethod
+    def _from_arrays(cls, observations, next_observations, actions, rewards,
+                     masks, dones_float, terminals, metadata=None):
+        """Construct a dataset directly from arrays (used by train_test_split)."""
+        ds = object.__new__(cls)
+        ds.observations = observations
+        ds.next_observations = next_observations
+        ds.actions = actions
+        ds.rewards = rewards
+        ds.masks = masks
+        ds.dones_float = dones_float
+        ds.terminals = terminals
+        ds.size = len(observations)
+        ds.metadata = metadata or {}
+        ds.file_index = []
+        ds._active_layout = metadata.get("obs_layout", []) if metadata else []
+        return ds
+
+    # ----- train / test split ----------------------------------------------
+
+    def train_test_split(self, test_ratio: float = 0.1, seed: int = 42):
+        """Split into train/test at the episode level.
+
+        Returns:
+            (train_dataset, test_dataset)
+        """
+        rng = np.random.RandomState(seed)
+
+        ep_ends = np.where(self.dones_float == 1.0)[0]
+        n_eps = len(ep_ends)
+        n_test = max(1, int(n_eps * test_ratio))
+
+        ep_order = rng.permutation(n_eps)
+        test_ep_set = set(ep_order[:n_test].tolist())
+
+        train_idx, test_idx = [], []
+        ep_start = 0
+        for ep_i, ep_end in enumerate(ep_ends):
+            indices = np.arange(ep_start, ep_end + 1)
+            if ep_i in test_ep_set:
+                test_idx.append(indices)
+            else:
+                train_idx.append(indices)
+            ep_start = ep_end + 1
+
+        if ep_start < self.size:
+            train_idx.append(np.arange(ep_start, self.size))
+
+        train_idx = np.concatenate(train_idx)
+        test_idx = np.concatenate(test_idx)
+
+        def _slice(idx):
+            return ManiFeelDataset._from_arrays(
+                self.observations[idx],
+                self.next_observations[idx],
+                self.actions[idx],
+                self.rewards[idx],
+                self.masks[idx],
+                self.dones_float[idx],
+                self.terminals[idx],
+                self.metadata,
+            )
+
+        return _slice(train_idx), _slice(test_idx)
 
     # ----- feature selection -----------------------------------------------
 
@@ -169,7 +232,7 @@ class ManiFeelDataset:
             f"  reward range:  [{self.rewards.min():.4f}, {self.rewards.max():.4f}]",
             f"  reward mean:   {self.rewards.mean():.4f}",
             f"  terminals:     {int(self.terminals.sum())} / {self.size}",
-            f"  dones:         {int(self._dones.sum())} / {self.size}",
+            f"  successes:     {int(self.dones_float.sum())} / {n_eps} episodes",
             f"  masks mean:    {self.masks.mean():.6f}",
         ]
         if self.metadata:
@@ -178,7 +241,7 @@ class ManiFeelDataset:
             if full_layout:
                 full_parts = [f"{e['name']}({e['dim']})" for e in full_layout]
                 lines.append(f"  file layout:   {' + '.join(full_parts)}")
-            if self._active_layout:
+            if hasattr(self, '_active_layout') and self._active_layout:
                 active_parts = [f"{e['name']}({e['dim']})" for e in self._active_layout]
                 lines.append(f"  active feats:  {' + '.join(active_parts)}")
         return "\n".join(lines)

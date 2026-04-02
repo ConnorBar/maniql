@@ -13,7 +13,7 @@ Batch = collections.namedtuple(
     ['observations', 'actions', 'rewards', 'masks', 'next_observations'])
 
 
-def default_init(scale: Optional[float] = jnp.sqrt(2)):
+def default_init(scale: Optional[float] = 2**0.5): # changed from jnp.sqrt(2) to 2**0.5 bc jax metal 
     return nn.initializers.orthogonal(scale)
 
 

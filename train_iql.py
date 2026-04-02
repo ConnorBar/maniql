@@ -1,17 +1,12 @@
 """Offline IQL training on ManiFeel preprocessed datasets.
 
-Usage (wrist + state only):
+Usage:
     python train_iql.py \
-        --dataset_path data/preprocessed/all_transitions_r3m_wrist_tactile_force_state.pkl \
-        --use_features wrist,state \
-        --save_dir runs/manifeel_iql_wrist_state \
-        --max_steps 500000
-
-Usage (full observation):
-    python train_iql.py \
-        --dataset_path data/preprocessed/all_transitions_r3m_wrist_tactile_force_state.pkl \
-        --save_dir runs/manifeel_iql_full \
-        --max_steps 500000
+        --dataset_path data/preprocessed/all_transitions_r3m_wrist_state.pkl \
+        --save_dir runs/manifeel_iql_wrist_state_clean \
+        --max_steps 200000 \
+        --test_ratio 0.1 \
+        --eval_interval 2000
 """
 
 import os
@@ -19,12 +14,15 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "implicit_q_learning"))
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import tqdm
 from absl import app, flags
 from ml_collections import config_flags
 from tensorboardX import SummaryWriter
 
+from critic import loss as expectile_loss
 from learner import Learner
 from manifeel_iql import ManiFeelDataset
 
@@ -34,9 +32,11 @@ flags.DEFINE_string("dataset_path", "", "Path to ManiFeel preprocessed pickle.")
 flags.DEFINE_string("save_dir", "./runs/manifeel_iql/", "Tensorboard + checkpoint dir.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_integer("log_interval", 1000, "Logging interval.")
+flags.DEFINE_integer("eval_interval", 2000, "Test-set evaluation interval.")
 flags.DEFINE_integer("batch_size", 256, "Mini batch size.")
 flags.DEFINE_integer("max_steps", int(1e6), "Number of gradient steps.")
 flags.DEFINE_integer("save_interval", 50000, "Checkpoint save interval (0 = final only).")
+flags.DEFINE_float("test_ratio", 0.1, "Fraction of episodes held out for test.")
 flags.DEFINE_boolean("tqdm", True, "Use tqdm progress bar.")
 flags.DEFINE_boolean("normalize_rewards", False, "Normalize rewards by trajectory return range.")
 flags.DEFINE_boolean("clip_actions", True, "Clip actions to [-1+eps, 1-eps].")
@@ -47,7 +47,6 @@ flags.DEFINE_string(
     "If unset, uses the full observation vector."
 )
 
-
 config_flags.DEFINE_config_file(
     "config",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "implicit_q_learning", "configs", "mujoco_config.py"),
@@ -55,6 +54,63 @@ config_flags.DEFINE_config_file(
     lock_config=False,
 )
 
+
+# ---- eval losses (read-only, no gradient updates) -------------------------
+
+@jax.jit
+def _eval_losses(actor, critic, value, target_critic, batch,
+                 discount, expectile, temperature, rng):
+    """Compute IQL losses on a batch without updating any parameters."""
+    # Q from target critic, V from value net
+    q1, q2 = target_critic(batch.observations, batch.actions)
+    q = jnp.minimum(q1, q2)
+    v = value(batch.observations)
+
+    # Value loss (expectile regression)
+    value_loss = expectile_loss(q - v, expectile).mean()
+
+    # Critic loss
+    next_v = value(batch.next_observations)
+    target_q = batch.rewards + discount * batch.masks * next_v
+    q1_pred, q2_pred = critic(batch.observations, batch.actions)
+    critic_loss = ((q1_pred - target_q) ** 2 + (q2_pred - target_q) ** 2).mean()
+
+    # Actor loss
+    dist = actor.apply_fn.apply({"params": actor.params}, batch.observations)
+    log_probs = dist.log_prob(batch.actions)
+    exp_a = jnp.minimum(jnp.exp((q - v) * temperature), 100.0)
+    actor_loss = -(exp_a * log_probs).mean()
+
+    return {
+        "critic_loss": critic_loss,
+        "value_loss": value_loss,
+        "actor_loss": actor_loss,
+        "v": v.mean(),
+        "q1": q1_pred.mean(),
+        "q2": q2_pred.mean(),
+        "adv": (q - v).mean(),
+    }
+
+
+def eval_on_dataset(agent, dataset, batch_size, n_batches=10):
+    """Average eval losses over multiple batches from dataset."""
+    accum = None
+    for _ in range(n_batches):
+        batch = dataset.sample(batch_size)
+        info = _eval_losses(
+            agent.actor, agent.critic, agent.value, agent.target_critic,
+            batch, agent.discount, agent.expectile, agent.temperature,
+            agent.rng,
+        )
+        if accum is None:
+            accum = {k: float(v) for k, v in info.items()}
+        else:
+            for k, v in info.items():
+                accum[k] += float(v)
+    return {k: v / n_batches for k, v in accum.items()}
+
+
+# ---- reward normalization -------------------------------------------------
 
 def normalize_rewards(dataset: ManiFeelDataset):
     """Normalize rewards by range of per-trajectory returns, scaled to 1000."""
@@ -103,38 +159,64 @@ def main(_):
     if FLAGS.use_features:
         use_features = [f.strip() for f in FLAGS.use_features.split(",") if f.strip()]
 
-    dataset = ManiFeelDataset(
+    full_dataset = ManiFeelDataset(
         FLAGS.dataset_path,
         use_features=use_features,
         clip_actions=FLAGS.clip_actions,
     )
-    print(dataset.summary())
+
+    # Episode-level train/test split
+    train_ds, test_ds = full_dataset.train_test_split(
+        test_ratio=FLAGS.test_ratio, seed=FLAGS.seed
+    )
+    print("=== Train set ===")
+    print(train_ds.summary())
+    print(f"\n=== Test set ===")
+    print(test_ds.summary())
+    print()
+
     if FLAGS.validate:
-        dataset.validate()
+        print("--- Train validation ---")
+        train_ds.validate()
+        print("--- Test validation ---")
+        test_ds.validate()
+        print()
 
     if FLAGS.normalize_rewards:
-        normalize_rewards(dataset)
+        normalize_rewards(train_ds)
+        normalize_rewards(test_ds)
 
     kwargs = dict(FLAGS.config)
     agent = Learner(
         FLAGS.seed,
-        dataset.observations[:1],   # sample obs  (1, obs_dim)
-        dataset.actions[:1],        # sample act  (1, act_dim)
+        train_ds.observations[:1],
+        train_ds.actions[:1],
         max_steps=FLAGS.max_steps,
         **kwargs,
     )
 
-    print(f"\n[START] Training IQL for {FLAGS.max_steps:,} steps (batch_size={FLAGS.batch_size})")
+    print(f"[START] Training IQL for {FLAGS.max_steps:,} steps "
+          f"(batch={FLAGS.batch_size}, train={train_ds.size:,}, test={test_ds.size:,})")
+
     for i in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm):
-        batch = dataset.sample(FLAGS.batch_size)
+        batch = train_ds.sample(FLAGS.batch_size)
         update_info = agent.update(batch)
 
         if i % FLAGS.log_interval == 0:
             for k, v in update_info.items():
                 if v.ndim == 0:
-                    summary_writer.add_scalar(f"training/{k}", float(v), i)
+                    summary_writer.add_scalar(f"train/{k}", float(v), i)
                 else:
-                    summary_writer.add_histogram(f"training/{k}", v, i)
+                    summary_writer.add_histogram(f"train/{k}", v, i)
+            summary_writer.flush()
+
+        if i % FLAGS.eval_interval == 0:
+            test_info = eval_on_dataset(agent, test_ds, FLAGS.batch_size)
+            train_info = eval_on_dataset(agent, train_ds, FLAGS.batch_size)
+            for k, v in test_info.items():
+                summary_writer.add_scalar(f"test/{k}", v, i)
+            for k, v in train_info.items():
+                summary_writer.add_scalar(f"train_eval/{k}", v, i)
             summary_writer.flush()
 
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
