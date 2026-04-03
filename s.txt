@@ -1,0 +1,3 @@
+export PATH=$PATH:/mnt/c/Users/cbarnsle/AppData/Local/Programs/cursor/resources/app/bin
+
+
