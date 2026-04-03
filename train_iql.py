@@ -12,10 +12,19 @@ Usage (multi-modal, all modalities with CNN/MLP encoders):
         --multimodal \
         --save_dir runs/manifeel_iql_multimodal \
         --max_steps 200000
+
+    If you see CUDA_ERROR_OUT_OF_MEMORY, lower VRAM use with e.g.
+    ``--batch_size 128`` or ``64`` (default 256 is aggressive for 3 CNN encoders).
 """
 
 import os
 import sys
+
+# JAX defaults to grabbing most GPU VRAM up front; on WSL / smaller GPUs that
+# often causes CUDA OOM during peaks (multimodal IQL uses large tactile batches).
+# Override with XLA_PYTHON_CLIENT_PREALLOCATE=true if you prefer the default.
+# this is the main reason that fixed the OOM issue
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 # gets access to critic and learner modules
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "implicit_q_learning"))
@@ -115,11 +124,12 @@ def eval_on_dataset(agent, dataset, batch_size, n_batches=10):
             batch, agent.discount, agent.expectile, agent.temperature,
             agent.rng,
         )
+        info = jax.device_get(info)
         if accum is None:
-            accum = {k: float(v) for k, v in info.items()}
+            accum = {k: float(np.asarray(v)) for k, v in info.items()}
         else:
             for k, v in info.items():
-                accum[k] += float(v)
+                accum[k] += float(np.asarray(v))
     return {k: v / n_batches for k, v in accum.items()}
 
 
@@ -235,7 +245,11 @@ def main(_):
         update_info = agent.update(batch)
 
         if i % FLAGS.log_interval == 0:
-            for k, v in update_info.items():
+            # One host transfer avoids repeated GPU syncs; scalars must be plain
+            # floats for TensorBoard (float(jax.Array) can fail under VRAM pressure).
+            info_host = jax.device_get(update_info)
+            for k, v in info_host.items():
+                v = np.asarray(v)
                 if v.ndim == 0:
                     summary_writer.add_scalar(f"train/{k}", float(v), i)
                 else:
