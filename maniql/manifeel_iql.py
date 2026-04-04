@@ -1,4 +1,8 @@
-"""Custom dataset loader: ManiFeel preprocessed pickle -> IQL Dataset interface."""
+"""Custom dataset loader: ManiFeel preprocessed pickle -> IQL Dataset interface.
+
+Expects split-storage pickles where ``obs`` and ``next_obs`` are dicts with
+keys ``pass`` (wrist+state), ``tact`` (tactile image volume), ``forcefield``.
+"""
 
 import collections
 import pickle
@@ -34,22 +38,11 @@ def _coerce_nested_split(data: dict) -> dict:
 
 
 class ManiFeelDataset:
-    """Loads a ManiFeel preprocessed pickle and exposes the same interface
-    that the IQL Learner expects (``sample(batch_size) -> Batch``).
-
-    * **concat** (``metadata["modality_storage"] == "concat"``): ``obs`` and
-      ``next_obs`` are 2D float32 arrays (flat features).  Optional
-      ``use_features`` slices columns via ``obs_layout``.
-    * **split** (``modality_storage == "split"``): ``obs`` and ``next_obs`` are
-      dicts with keys ``pass`` (wrist+state), ``tact`` (image volume),
-      ``forcefield``.  Batches expose the same dict structure on
-      ``observations`` / ``next_observations`` for multimodal IQL.
-
-    Legacy pkls with top-level ``obs_passthrough`` keys are still loaded.
+    """Loads a ManiFeel preprocessed pickle (split-storage) and exposes the
+    ``sample(batch_size) -> Batch`` interface that IQL expects.
 
     Args:
         pkl_path: Path to the preprocessed pickle file.
-        use_features: Feature subset (concat only).
         clip_actions: Clip actions to [-1+eps, 1-eps].
         eps: Clipping epsilon.
     """
@@ -57,7 +50,6 @@ class ManiFeelDataset:
     def __init__(
         self,
         pkl_path: str,
-        use_features: list = None,
         clip_actions: bool = True,
         eps: float = 1e-5,
     ):
@@ -68,12 +60,12 @@ class ManiFeelDataset:
         self.metadata = data.get("metadata", {})
         self.file_index = data.get("file_index", [])
 
-        is_split_struct = isinstance(data.get("obs"), dict) and SPLIT_KEYS[0] in data["obs"]
-        # Nested ``obs`` always means split; otherwise use metadata (default concat).
-        if is_split_struct:
-            self.modality_storage = "split"
-        else:
-            self.modality_storage = self.metadata.get("modality_storage", "concat")
+        if not (isinstance(data.get("obs"), dict) and SPLIT_KEYS[0] in data["obs"]):
+            raise ValueError(
+                "Expected split-storage pickle with obs dict keys "
+                f"{SPLIT_KEYS}, got flat obs array or missing keys.  "
+                "Re-run seed_data.py with all four features."
+            )
 
         actions = data["actions"].astype(np.float32)
         rewards = data["rewards"].astype(np.float32).ravel()
@@ -83,26 +75,9 @@ class ManiFeelDataset:
             lim = 1.0 - eps
             actions = np.clip(actions, -lim, lim)
 
-        if self.modality_storage == "split":
-            if use_features is not None:
-                raise ValueError(
-                    "use_features is not supported for modality-split pickles. "
-                    "Use a concat-format dataset or omit use_features."
-                )
-            self._obs = {k: data["obs"][k].astype(np.float32) for k in SPLIT_KEYS}
-            self._next_obs = {k: data["next_obs"][k].astype(np.float32) for k in SPLIT_KEYS}
-            self.observations = None
-            self.next_observations = None
-            self.size = len(self._obs[SPLIT_KEYS[0]])
-        else:
-            obs = data["obs"].astype(np.float32)
-            next_obs = data["next_obs"].astype(np.float32)
-            obs, next_obs = self._select_features(obs, next_obs, use_features)
-            self.observations = obs
-            self.next_observations = next_obs
-            self._obs = None
-            self._next_obs = None
-            self.size = len(obs)
+        self._obs = {k: data["obs"][k].astype(np.float32) for k in SPLIT_KEYS}
+        self._next_obs = {k: data["next_obs"][k].astype(np.float32) for k in SPLIT_KEYS}
+        self.size = len(self._obs[SPLIT_KEYS[0]])
 
         self.actions = actions
         self.rewards = rewards
@@ -113,48 +88,13 @@ class ManiFeelDataset:
 
     def observation_example(self):
         """One transition as a pytree with leading batch dim 1 (for model init)."""
-        if self.modality_storage == "split":
-            return {k: self._obs[k][:1] for k in SPLIT_KEYS}
-        return self.observations[:1]
+        return {k: self._obs[k][:1] for k in SPLIT_KEYS}
 
     def _pack_obs_batch(self, idx: np.ndarray):
-        if self.modality_storage == "split":
-            return {k: self._obs[k][idx] for k in SPLIT_KEYS}
-        return self.observations[idx]
+        return {k: self._obs[k][idx] for k in SPLIT_KEYS}
 
     def _pack_next_batch(self, idx: np.ndarray):
-        if self.modality_storage == "split":
-            return {k: self._next_obs[k][idx] for k in SPLIT_KEYS}
-        return self.next_observations[idx]
-
-    @classmethod
-    def _from_arrays(
-        cls,
-        observations,
-        next_observations,
-        actions,
-        rewards,
-        masks,
-        dones_float,
-        terminals,
-        metadata=None,
-    ):
-        ds = object.__new__(cls)
-        ds.modality_storage = "concat"
-        ds.metadata = metadata or {}
-        ds.file_index = []
-        ds._active_layout = metadata.get("obs_layout", []) if metadata else []
-        ds.observations = observations
-        ds.next_observations = next_observations
-        ds._obs = None
-        ds._next_obs = None
-        ds.actions = actions
-        ds.rewards = rewards
-        ds.masks = masks
-        ds.dones_float = dones_float
-        ds.terminals = terminals
-        ds.size = len(observations)
-        return ds
+        return {k: self._next_obs[k][idx] for k in SPLIT_KEYS}
 
     @classmethod
     def _from_split_dicts(
@@ -169,14 +109,10 @@ class ManiFeelDataset:
         metadata=None,
     ):
         ds = object.__new__(cls)
-        ds.modality_storage = "split"
         ds.metadata = metadata or {}
         ds.file_index = []
-        ds._active_layout = []
         ds._obs = {k: obs[k] for k in SPLIT_KEYS}
         ds._next_obs = {k: next_obs[k] for k in SPLIT_KEYS}
-        ds.observations = None
-        ds.next_observations = None
         ds.actions = actions
         ds.rewards = rewards
         ds.masks = masks
@@ -209,71 +145,19 @@ class ManiFeelDataset:
         train_idx = np.concatenate(train_idx)
         test_idx = np.concatenate(test_idx)
 
-        if self.modality_storage == "split":
-            def _slice(idx):
-                return ManiFeelDataset._from_split_dicts(
-                    {k: self._obs[k][idx] for k in SPLIT_KEYS},
-                    {k: self._next_obs[k][idx] for k in SPLIT_KEYS},
-                    self.actions[idx],
-                    self.rewards[idx],
-                    self.masks[idx],
-                    self.dones_float[idx],
-                    self.terminals[idx],
-                    self.metadata,
-                )
-        else:
-            def _slice(idx):
-                return ManiFeelDataset._from_arrays(
-                    self.observations[idx],
-                    self.next_observations[idx],
-                    self.actions[idx],
-                    self.rewards[idx],
-                    self.masks[idx],
-                    self.dones_float[idx],
-                    self.terminals[idx],
-                    self.metadata,
-                )
-
-        return _slice(train_idx), _slice(test_idx)
-
-    def _select_features(self, obs, next_obs, use_features):
-        if use_features is None:
-            self._active_layout = self.metadata.get("obs_layout", [])
-            return obs, next_obs
-
-        layout = self.metadata.get("obs_layout", [])
-        if not layout:
-            raise ValueError(
-                "use_features requires obs_layout in metadata, but the "
-                "preprocessed file has none.  Re-run seed_data.py or pass "
-                "use_features=None to use the full observation."
+        def _slice(idx):
+            return ManiFeelDataset._from_split_dicts(
+                {k: self._obs[k][idx] for k in SPLIT_KEYS},
+                {k: self._next_obs[k][idx] for k in SPLIT_KEYS},
+                self.actions[idx],
+                self.rewards[idx],
+                self.masks[idx],
+                self.dones_float[idx],
+                self.terminals[idx],
+                self.metadata,
             )
 
-        layout_by_name = {entry["name"]: entry for entry in layout}
-        _aliases = {
-            "wrist": "wrist",
-            "tactile": "right_tactile_camera_taxim",
-            "forcefield": "tactile_force_field_right",
-            "state": "state",
-        }
-
-        col_indices = []
-        active_layout = []
-        for feat in use_features:
-            key = _aliases.get(feat, feat)
-            if key not in layout_by_name:
-                available = [e["name"] for e in layout]
-                raise ValueError(
-                    f"Feature '{feat}' (mapped to '{key}') not found in "
-                    f"obs_layout. Available: {available}"
-                )
-            entry = layout_by_name[key]
-            col_indices.extend(range(entry["start"], entry["end"]))
-            active_layout.append(entry)
-
-        col_indices = np.array(col_indices, dtype=np.intp)
-        self._active_layout = active_layout
-        return obs[:, col_indices], next_obs[:, col_indices]
+        return _slice(train_idx), _slice(test_idx)
 
     # ----- IQL interface ---------------------------------------------------
 
@@ -292,19 +176,11 @@ class ManiFeelDataset:
     def validate(self) -> bool:
         """Run sanity checks and print warnings.  Returns True if clean."""
         ok = True
-        if self.modality_storage == "split":
-            to_check = (
-                [(f"obs.{k}", self._obs[k]) for k in SPLIT_KEYS]
-                + [(f"next_obs.{k}", self._next_obs[k]) for k in SPLIT_KEYS]
-                + [("actions", self.actions), ("rewards", self.rewards)]
-            )
-        else:
-            to_check = [
-                ("observations", self.observations),
-                ("next_observations", self.next_observations),
-                ("actions", self.actions),
-                ("rewards", self.rewards),
-            ]
+        to_check = (
+            [(f"obs.{k}", self._obs[k]) for k in SPLIT_KEYS]
+            + [(f"next_obs.{k}", self._next_obs[k]) for k in SPLIT_KEYS]
+            + [("actions", self.actions), ("rewards", self.rewards)]
+        )
 
         for name, arr in to_check:
             if np.any(np.isnan(arr)):
@@ -337,20 +213,16 @@ class ManiFeelDataset:
 
     def summary(self) -> str:
         n_eps = int(self.dones_float.sum())
-        if self.modality_storage == "split":
-            k0, k1, k2 = SPLIT_KEYS
-            ptp_d = int(self._obs[k0].shape[1])
-            tac_shp = self._obs[k1].shape[1:]
-            ff_d = int(self._obs[k2].shape[1])
-            obs_line = (
-                f"  obs (split):   {k0}({ptp_d}) + {k1}{tac_shp} + {k2}({ff_d})"
-            )
-        else:
-            obs_line = f"  obs dim:       {self.observations.shape[1]}"
+        k0, k1, k2 = SPLIT_KEYS
+        ptp_d = int(self._obs[k0].shape[1])
+        tac_shp = self._obs[k1].shape[1:]
+        ff_d = int(self._obs[k2].shape[1])
+        obs_line = (
+            f"  obs (split):   {k0}({ptp_d}) + {k1}{tac_shp} + {k2}({ff_d})"
+        )
 
         lines = [
             f"ManiFeelDataset: {self.size:,} transitions, {n_eps} episodes",
-            f"  storage:       {self.modality_storage}",
             obs_line,
             f"  action dim:    {self.actions.shape[1]}",
             f"  reward range:  [{self.rewards.min():.4f}, {self.rewards.max():.4f}]",
@@ -361,11 +233,4 @@ class ManiFeelDataset:
         ]
         if self.metadata:
             lines.append(f"  wrist_encoder: {self.metadata.get('wrist_encoder', '?')}")
-            full_layout = self.metadata.get("obs_layout", [])
-            if full_layout and self.modality_storage == "concat":
-                full_parts = [f"{e['name']}({e['dim']})" for e in full_layout]
-                lines.append(f"  file layout:   {' + '.join(full_parts)}")
-            if hasattr(self, "_active_layout") and self._active_layout:
-                active_parts = [f"{e['name']}({e['dim']})" for e in self._active_layout]
-                lines.append(f"  active feats:  {' + '.join(active_parts)}")
         return "\n".join(lines)

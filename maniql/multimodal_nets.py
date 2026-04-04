@@ -1,11 +1,11 @@
 """Multi-modal IQL networks: CNN for tactile, MLP for forcefield, trained end-to-end.
 
 Architecture:
-  R3M wrist (2048)       -> passthrough
-  tactile (160,120,3)    -> CNN encoder -> 256
-  forcefield (420 flat)  -> MLP encoder -> 128
-  state (7)              -> passthrough
-  Combined (2439-dim)    -> standard IQL MLP heads (value, critic, actor)
+  R3M wrist (dim from data)  -> passthrough
+  tactile (160,120,3)        -> CNN encoder -> 256
+  forcefield (420 flat)      -> MLP encoder -> 128
+  state (7)                  -> passthrough
+  Combined -> standard IQL MLP heads (value, critic, actor)
 
 Each IQL head (value, double-critic, actor) has its own encoder copy so
 gradients from each loss flow through a dedicated encoder.  This is the
@@ -18,7 +18,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "implicit_q_learning"))
 
-from typing import Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import flax.linen as nn
 import jax
@@ -36,19 +36,37 @@ tfd = tfp.distributions
 tfb = tfp.bijectors
 
 # ---------------------------------------------------------------------------
-#  Observation layout (matches seed_data.py output order)
+#  Observation constants
 # ---------------------------------------------------------------------------
-WRIST_DIM = 2048
-TACTILE_FLAT_DIM = 57_600          # 160 * 120 * 3
-TACTILE_SHAPE = (160, 120, 3)
-FORCEFIELD_FLAT_DIM = 420          # 10 * 14 * 3
 STATE_DIM = 7
 
 TACTILE_ENC_DIM = 256
 FORCEFIELD_ENC_DIM = 128
 
-FULL_OBS_DIM = WRIST_DIM + TACTILE_FLAT_DIM + FORCEFIELD_FLAT_DIM + STATE_DIM
-ENCODED_DIM = WRIST_DIM + TACTILE_ENC_DIM + FORCEFIELD_ENC_DIM + STATE_DIM
+
+def multimodal_encoded_dim(wrist_dim: int) -> int:
+    """Encoder output size after tactile + forcefield CNN/MLP (wrist+state passthrough)."""
+    return wrist_dim + TACTILE_ENC_DIM + FORCEFIELD_ENC_DIM + STATE_DIM
+
+
+def infer_wrist_dim(metadata: Mapping[str, Any], obs_example: dict) -> int:
+    """Resolve wrist embedding width from pickle metadata and a batch-1 split observation.
+
+    ``obs["pass"]`` is wrist+state; ``metadata["obs_modality_spec"]["passthrough_order"]``
+    describes the ordering (default ``["wrist", "state"]``).
+    """
+    passthrough = obs_example["pass"]
+    pass_dim = int(np.asarray(passthrough).shape[-1])
+    spec = metadata.get("obs_modality_spec") or {}
+    order = spec.get("passthrough_order") or ["wrist", "state"]
+    if order == ["wrist"]:
+        return pass_dim
+    if set(order) <= {"wrist", "state"} and len(order) == 2:
+        return pass_dim - STATE_DIM
+    raise ValueError(
+        f"Cannot infer wrist_dim from passthrough_order={order!r}; "
+        "extend infer_wrist_dim if you add modalities to `pass`."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,41 +112,19 @@ class ForceFieldEncoder(nn.Module):
 class ObsEncoder(nn.Module):
     """Encodes tactile + forcefield and concatenates with passthrough (wrist+state).
 
-    * **Split dict** (``metadata["modality_storage"] == "split"``): keys
-      ``pass`` (passthrough), ``tact`` ``(B,H,W,C)``, ``forcefield`` ``(B,420)``.
-    * **Flat vector** (legacy concat pickle): layout
-      ``[wrist | tactile | forcefield | state]``.
+    Expects a split-dict observation with keys
+    ``pass`` (passthrough), ``tact`` ``(B,H,W,C)``, ``forcefield`` ``(B,420)``.
     """
+    wrist_dim: int
+
     @nn.compact
-    def __call__(self, observations) -> jnp.ndarray:
-        # Split-format batches use a dict; legacy concat uses (B, full_dim).
-        if getattr(observations, "ndim", None) == 2:
-            return self._encode_flat(observations)
+    def __call__(self, observations: dict) -> jnp.ndarray:
         passthrough = observations["pass"]
         tactile = observations["tact"]
         ff_flat = observations["forcefield"]
         tac_feat = TactileEncoder()(tactile)
         ff_feat = ForceFieldEncoder()(ff_flat)
         return jnp.concatenate([passthrough, tac_feat, ff_feat], axis=-1)
-
-    def _encode_flat(self, obs_flat: jnp.ndarray) -> jnp.ndarray:
-        idx = 0
-        wrist = obs_flat[:, idx : idx + WRIST_DIM]
-        idx += WRIST_DIM
-
-        tac_flat = obs_flat[:, idx : idx + TACTILE_FLAT_DIM]
-        idx += TACTILE_FLAT_DIM
-        tactile = tac_flat.reshape(-1, *TACTILE_SHAPE)
-
-        ff_flat = obs_flat[:, idx : idx + FORCEFIELD_FLAT_DIM]
-        idx += FORCEFIELD_FLAT_DIM
-
-        state = obs_flat[:, idx : idx + STATE_DIM]
-
-        tac_feat = TactileEncoder()(tactile)
-        ff_feat = ForceFieldEncoder()(ff_flat)
-
-        return jnp.concatenate([wrist, tac_feat, ff_feat, state], axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -137,21 +133,23 @@ class ObsEncoder(nn.Module):
 
 class MMValueCritic(nn.Module):
     hidden_dims: Sequence[int]
+    wrist_dim: int
 
     @nn.compact
     def __call__(self, observations) -> jnp.ndarray:
-        encoded = ObsEncoder()(observations)
+        encoded = ObsEncoder(wrist_dim=self.wrist_dim)(observations)
         critic = MLP((*self.hidden_dims, 1))(encoded)
         return jnp.squeeze(critic, -1)
 
 
 class MMCritic(nn.Module):
     hidden_dims: Sequence[int]
+    wrist_dim: int
     activations: callable = nn.relu
 
     @nn.compact
     def __call__(self, observations, actions: jnp.ndarray) -> jnp.ndarray:
-        encoded = ObsEncoder()(observations)
+        encoded = ObsEncoder(wrist_dim=self.wrist_dim)(observations)
         inputs = jnp.concatenate([encoded, actions], -1)
         critic = MLP((*self.hidden_dims, 1),
                      activations=self.activations)(inputs)
@@ -160,19 +158,21 @@ class MMCritic(nn.Module):
 
 class MMDoubleCritic(nn.Module):
     hidden_dims: Sequence[int]
+    wrist_dim: int
     activations: callable = nn.relu
 
     @nn.compact
     def __call__(self, observations, actions: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        c1 = MMCritic(self.hidden_dims, activations=self.activations)(
+        c1 = MMCritic(self.hidden_dims, self.wrist_dim, activations=self.activations)(
             observations, actions)
-        c2 = MMCritic(self.hidden_dims, activations=self.activations)(
+        c2 = MMCritic(self.hidden_dims, self.wrist_dim, activations=self.activations)(
             observations, actions)
         return c1, c2
 
 
 class MMNormalTanhPolicy(nn.Module):
     hidden_dims: Sequence[int]
+    wrist_dim: int
     action_dim: int
     state_dependent_std: bool = True
     dropout_rate: Optional[float] = None
@@ -185,7 +185,7 @@ class MMNormalTanhPolicy(nn.Module):
     def __call__(self, observations,
                  temperature: float = 1.0,
                  training: bool = False) -> tfd.Distribution:
-        encoded = ObsEncoder()(observations)
+        encoded = ObsEncoder(wrist_dim=self.wrist_dim)(observations)
 
         outputs = MLP(self.hidden_dims, activate_final=True,
                       dropout_rate=self.dropout_rate)(encoded,
@@ -251,8 +251,8 @@ def _mm_update_jit(
 class MultiModalLearner:
     """IQL Learner with per-head CNN/MLP observation encoders.
 
-    Drop-in replacement for ``learner.Learner`` -- exposes the same
-    ``update(batch)`` and ``sample_actions(obs)`` API.
+    Exposes the same ``update(batch)`` and ``sample_actions(obs)`` API as
+    ``learner.Learner``.
     """
 
     def __init__(
@@ -260,6 +260,7 @@ class MultiModalLearner:
         seed: int,
         observations,
         actions: jnp.ndarray,
+        wrist_dim: int,
         actor_lr: float = 3e-4,
         value_lr: float = 3e-4,
         critic_lr: float = 3e-4,
@@ -284,7 +285,7 @@ class MultiModalLearner:
 
         # --- actor ---
         actor_def = MMNormalTanhPolicy(
-            hidden_dims, action_dim,
+            hidden_dims, wrist_dim, action_dim,
             log_std_scale=1e-3, log_std_min=-5.0,
             dropout_rate=dropout_rate,
             state_dependent_std=False,
@@ -300,13 +301,13 @@ class MultiModalLearner:
                              inputs=[actor_key, observations], tx=optimiser)
 
         # --- critic ---
-        critic_def = MMDoubleCritic(hidden_dims)
+        critic_def = MMDoubleCritic(hidden_dims, wrist_dim=wrist_dim)
         critic = Model.create(critic_def,
                               inputs=[critic_key, observations, actions],
                               tx=optax.adam(learning_rate=critic_lr))
 
         # --- value ---
-        value_def = MMValueCritic(hidden_dims)
+        value_def = MMValueCritic(hidden_dims, wrist_dim=wrist_dim)
         value = Model.create(value_def,
                              inputs=[value_key, observations],
                              tx=optax.adam(learning_rate=value_lr))
