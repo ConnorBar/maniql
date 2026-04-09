@@ -19,7 +19,12 @@ checkpoints/
 # TensorBoard logs
 events.out.tfevents.*
 
-runs/
-data/
-IsaacGym_Preview_TacSL_Package/
-manifeel-isaacgymenvs/
+runs/*
+data/*
+IsaacGym_Preview_TacSL_Package/*
+manifeel-isaacgymenvs/*
+
+!runs/.gitkeep
+!data/.gitkeep
+!IsaacGym_Preview_TacSL_Package/.gitkeep
+!manifeel-isaacgymenvs/.gitkeep
