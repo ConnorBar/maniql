@@ -26,5 +26,3 @@ manifeel-isaacgymenvs/*
 
 !runs/.gitkeep
 !data/.gitkeep
-!IsaacGym_Preview_TacSL_Package/.gitkeep
-!manifeel-isaacgymenvs/.gitkeep

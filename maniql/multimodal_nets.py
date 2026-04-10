@@ -218,7 +218,7 @@ class MMNormalTanhPolicy(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-#  Multi-modal Learner
+#  Multi-modal Learner -> implicit_q_learning/learner.py
 # ---------------------------------------------------------------------------
 
 def _mm_target_update(critic: Model, target_critic: Model,

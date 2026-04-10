@@ -77,6 +77,7 @@ class ManiFeelDataset:
 
         self._obs = {k: data["obs"][k].astype(np.float32) for k in SPLIT_KEYS}
         self._next_obs = {k: data["next_obs"][k].astype(np.float32) for k in SPLIT_KEYS}
+        self._indices = None  # optional indirection for train/test splits (avoid big copies)
         self.size = len(self._obs[SPLIT_KEYS[0]])
 
         self.actions = actions
@@ -88,12 +89,19 @@ class ManiFeelDataset:
 
     def observation_example(self):
         """One transition as a pytree with leading batch dim 1 (for model init)."""
-        return {k: self._obs[k][:1] for k in SPLIT_KEYS}
+        if self._indices is None:
+            return {k: self._obs[k][:1] for k in SPLIT_KEYS}
+        base_i = int(self._indices[0])
+        return {k: self._obs[k][base_i:base_i + 1] for k in SPLIT_KEYS}
 
     def _pack_obs_batch(self, idx: np.ndarray):
+        if self._indices is not None:
+            idx = self._indices[idx]
         return {k: self._obs[k][idx] for k in SPLIT_KEYS}
 
     def _pack_next_batch(self, idx: np.ndarray):
+        if self._indices is not None:
+            idx = self._indices[idx]
         return {k: self._next_obs[k][idx] for k in SPLIT_KEYS}
 
     @classmethod
@@ -107,6 +115,7 @@ class ManiFeelDataset:
         dones_float,
         terminals,
         metadata=None,
+        indices=None,
     ):
         ds = object.__new__(cls)
         ds.metadata = metadata or {}
@@ -118,12 +127,24 @@ class ManiFeelDataset:
         ds.masks = masks
         ds.dones_float = dones_float
         ds.terminals = terminals
-        ds.size = len(ds._obs[SPLIT_KEYS[0]])
+        ds._indices = indices
+        ds.size = int(len(indices)) if indices is not None else len(ds._obs[SPLIT_KEYS[0]])
         return ds
 
     def train_test_split(self, test_ratio: float = 0.1, seed: int = 42):
         rng = np.random.RandomState(seed)
-        ep_ends = np.where(self.dones_float == 1.0)[0]
+
+        # IMPORTANT: Use index-based split so we don't duplicate multi-GB tactile arrays.
+        # We always split in the base dataset index space.
+        if self._indices is not None:
+            base_done = self.dones_float[self._indices]
+            ep_ends_local = np.where(base_done == 1.0)[0]
+            base_indices = self._indices
+        else:
+            ep_ends_local = np.where(self.dones_float == 1.0)[0]
+            base_indices = None
+
+        ep_ends = ep_ends_local
         n_eps = len(ep_ends)
         n_test = max(1, int(n_eps * test_ratio))
         ep_order = rng.permutation(n_eps)
@@ -139,25 +160,38 @@ class ManiFeelDataset:
                 train_idx.append(indices)
             ep_start = ep_end + 1
 
-        if ep_start < self.size:
-            train_idx.append(np.arange(ep_start, self.size))
+        if ep_start < (len(ep_ends_local) and (ep_ends_local[-1] + 1) or 0):
+            # unreachable, but keep structure
+            pass
+        # If the last episode doesn't end with done=True, include tail as train.
+        local_size = int(len(self._indices)) if self._indices is not None else int(self.size)
+        if ep_start < local_size:
+            train_idx.append(np.arange(ep_start, local_size))
 
         train_idx = np.concatenate(train_idx)
         test_idx = np.concatenate(test_idx)
 
-        def _slice(idx):
+        if base_indices is not None:
+            train_base = base_indices[train_idx]
+            test_base = base_indices[test_idx]
+        else:
+            train_base = train_idx
+            test_base = test_idx
+
+        def _make_indexed(indices_base: np.ndarray):
             return ManiFeelDataset._from_split_dicts(
-                {k: self._obs[k][idx] for k in SPLIT_KEYS},
-                {k: self._next_obs[k][idx] for k in SPLIT_KEYS},
-                self.actions[idx],
-                self.rewards[idx],
-                self.masks[idx],
-                self.dones_float[idx],
-                self.terminals[idx],
+                self._obs,
+                self._next_obs,
+                self.actions,
+                self.rewards,
+                self.masks,
+                self.dones_float,
+                self.terminals,
                 self.metadata,
+                indices=indices_base.astype(np.int64, copy=False),
             )
 
-        return _slice(train_idx), _slice(test_idx)
+        return _make_indexed(train_base), _make_indexed(test_base)
 
     # ----- IQL interface ---------------------------------------------------
 
@@ -175,6 +209,38 @@ class ManiFeelDataset:
 
     def validate(self) -> bool:
         """Run sanity checks and print warnings.  Returns True if clean."""
+        def _finite_check(name: str, arr: np.ndarray, batch: int = 256) -> bool:
+            """Check NaN/Inf without allocating full-size masks.
+
+            Large modalities (e.g. tactile volumes) can be multi-GB; calling
+            np.isnan(arr) materializes a full boolean array and may OOM.
+            We instead scan along the first dimension in chunks.
+            """
+            nonlocal ok
+            a = np.asarray(arr)
+            n0 = int(a.shape[0]) if a.ndim > 0 else 1
+            if a.ndim == 0:
+                if np.isnan(a):
+                    print(f"[WARN] NaN detected in {name}")
+                    ok = False
+                if np.isinf(a):
+                    print(f"[WARN] Inf detected in {name}")
+                    ok = False
+                return ok
+
+            for i in range(0, n0, batch):
+                sl = slice(i, min(i + batch, n0))
+                chunk = a[sl]
+                if np.isnan(chunk).any():
+                    print(f"[WARN] NaN detected in {name} (chunk {sl.start}:{sl.stop})")
+                    ok = False
+                    return False
+                if np.isinf(chunk).any():
+                    print(f"[WARN] Inf detected in {name} (chunk {sl.start}:{sl.stop})")
+                    ok = False
+                    return False
+            return True
+
         ok = True
         to_check = (
             [(f"obs.{k}", self._obs[k]) for k in SPLIT_KEYS]
@@ -183,12 +249,7 @@ class ManiFeelDataset:
         )
 
         for name, arr in to_check:
-            if np.any(np.isnan(arr)):
-                print(f"[WARN] NaN detected in {name}")
-                ok = False
-            if np.any(np.isinf(arr)):
-                print(f"[WARN] Inf detected in {name}")
-                ok = False
+            _finite_check(name, arr)
 
         n_eps = int(self.dones_float.sum())
         ep_lengths = []

@@ -32,20 +32,20 @@ def parse_args():
             "Keeps RAM bounded by flushing chunks, then merges chunks."
         )
     )
-    parser.add_argument("--input-dir", type=str, default="/home/purduerm/cap/data")
+    parser.add_argument("--input-dir", type=str, default="/home/connors/capstone/data")
     parser.add_argument("--input-glob", type=str, default="*_transitions.pkl")
     parser.add_argument(
         "--output",
         type=str,
-        default="/home/purduerm/cap/data/preprocessed/all_transitions_preprocessed.pkl",
+        default="/home/connors/capstone/data/preprocessed/all_transitions_preprocessed.pkl",
     )
     parser.add_argument("--wrist-encoder", type=str, default="r3m", choices=["raw", "r3m", "vip"])
     parser.add_argument("--wrist-model", type=str, default="resnet18", choices=["resnet18", "resnet34", "resnet50"])
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--seed-start", type=int, default=1000)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--r3m-repo", type=str, default="/home/purduerm/cap/work/furniture-bench/r3m")
-    parser.add_argument("--vip-repo", type=str, default="/home/purduerm/cap/work/furniture-bench/vip")
+    parser.add_argument("--r3m-repo", type=str, default="/home/connors/capstone/maniql/r3m")
+    parser.add_argument("--vip-repo", type=str, default="/home/connors/capstone/maniql/vip")
     parser.add_argument(
         "--chunk-size-files",
         type=int,

@@ -41,6 +41,13 @@ flags.DEFINE_string("save_dir", "./runs/manifeel_iql/", "Tensorboard + checkpoin
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_integer("log_interval", 1000, "Logging interval.")
 flags.DEFINE_integer("eval_interval", 2000, "Test-set evaluation interval.")
+flags.DEFINE_string(
+    "env_name",
+    "",
+    "Optional gym env for rollout eval (official IQL-style). "
+    "If empty, rollout evaluation is skipped.",
+)
+flags.DEFINE_integer("eval_episodes", 10, "Number of episodes for rollout evaluation.")
 flags.DEFINE_integer("batch_size", 256, "Mini batch size.")
 flags.DEFINE_integer("max_steps", int(1e6), "Number of gradient steps.")
 flags.DEFINE_integer("save_interval", 50000, "Checkpoint save interval (0 = final only).")
@@ -144,6 +151,36 @@ def save_checkpoint(agent, save_dir: str, step: int):
     agent.value.save(os.path.join(ckpt_dir, "value.flax"))
 
 
+def _maybe_make_eval_env(env_name: str, seed: int):
+    """Best-effort gym env construction for rollout evaluation.
+
+    This mirrors the official IQL `train_offline.py` path (wrappers + evaluate)
+    but stays optional so ManiFeel training doesn't require gym/d4rl.
+    """
+    if not env_name:
+        print(f"[WARN] No environment name provided, skipping rollout evaluation.")
+        return None, None
+    try:
+        import gym  # type: ignore
+        import wrappers  # from implicit_q_learning/wrappers via sys.path insert
+        from evaluation import evaluate  # from implicit_q_learning
+    except Exception as e:
+        print(f"[WARN] Rollout eval disabled (missing deps): {e}")
+        return None, None
+
+    try:
+        env = gym.make(env_name)
+        env = wrappers.EpisodeMonitor(env)
+        env = wrappers.SinglePrecision(env)
+        env.seed(seed)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        return env, evaluate
+    except Exception as e:
+        print(f"[WARN] Failed to create rollout eval env {env_name!r}: {e}")
+        return None, None
+
+
 def main(_):
     if not FLAGS.dataset_path:
         raise ValueError("--dataset_path is required.")
@@ -196,6 +233,10 @@ def main(_):
         **kwargs,
     )
 
+    # passthrough until i implement isaac gym connection
+    eval_env, eval_fn = _maybe_make_eval_env(FLAGS.env_name, FLAGS.seed)
+    eval_returns = []
+
     print(f"[START] Training IQL (multi-modal CNN+MLP) for {FLAGS.max_steps:,} steps "
           f"(batch={FLAGS.batch_size}, train={train_ds.size:,}, test={test_ds.size:,})")
 
@@ -221,6 +262,22 @@ def main(_):
             for k, v in train_info.items():
                 summary_writer.add_scalar(f"train_eval/{k}", v, i)
             summary_writer.flush()
+
+            # Optional: official IQL-style rollout evaluation when a simulator is available.
+            if eval_env is not None and eval_fn is not None:
+                try:
+                    eval_stats = eval_fn(agent, eval_env, FLAGS.eval_episodes)
+                    for k, v in eval_stats.items():
+                        summary_writer.add_scalar(f"evaluation/average_{k}s", v, i)
+                    summary_writer.flush()
+                    eval_returns.append((i, float(eval_stats.get("return", np.nan))))
+                    np.savetxt(
+                        os.path.join(FLAGS.save_dir, f"{FLAGS.seed}.txt"),
+                        eval_returns,
+                        fmt=["%d", "%.1f"],
+                    )
+                except Exception as e:
+                    print(f"[WARN] Rollout eval failed at step {i}: {e}")
 
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
             save_checkpoint(agent, FLAGS.save_dir, i)
