@@ -1,19 +1,20 @@
 # ManiQL: TacSL Multimodal Implicit Q-Learning
 
-This repository contains the implementation of ManiQL, a multimodal implicit Q-learning framework for TacSL (Tactile Sensing for Learning) robotic manipulation tasks. The project integrates visual (wrist camera) and tactile modalities using R3M (Representation for Robotic Manipulation) for visual encoding and Implicit Q-Learning (IQL) algorithms.
+This repository contains the implementation of ManiQL, a multimodal implicit Q-learning framework for TacSL (Tactile Sensing for Learning) robotic manipulation tasks. The current pipeline stores wrist and tactile images as raw observations and trains Flax ResNet vision backbones end-to-end during IQL, with optional R3M checkpoint initialization.
 
 ## Project Structure
 
 - `maniql/`: Main implementation directory
   - `implicit_q_learning/`: Reference IQL implementation (adapted for multimodal use)
-  - `r3m/`: Reference R3M model for visual representation learning
+  - `vision_backbone.py`: Flax ResNet backbone and R3M weight-loading utilities
+  - `r3m/`: Reference R3M code and checkpoints for optional pretrained initialization
   - `train_iql.py`: Training script for IQL
-  - `manifeel_iql.py`: ManiQL-specific IQL implementation
-  - `multimodal_nets.py`: Neural networks for multimodal processing
-  - `obs_modality.py`: Observation modality handling
-  - `seed_data.py`: Data seeding and preprocessing utilities
+  - `manifeel_iql.py`: Dataset loading and ManiQL-specific IQL integration
+  - `multimodal_nets.py`: Multimodal actor/critic/value networks with shared modality handling
+  - `obs_modality.py`: Observation schemas for `wrist_state` and `full` modes
+  - `seed_data.py`: Raw-data preprocessing into IQL-ready pickles
   - `visualize_transitions.py`: Visualization tools
-  - `inspect_data.py`: Data inspection scripts
+  - `inspect_data.py`: Data inspection for the new raw-observation schemas
 
 - `manifeel-isaacgymenvs/`: Cloned Isaac Gym environments for tactile manipulation
 - `IsaacGym_Preview_TacSL_Package/`: TacSL-specific Isaac Gym package (downloaded separately)
@@ -46,52 +47,65 @@ This repository contains the implementation of ManiQL, a multimodal implicit Q-l
 
 ## Data Preprocessing
 
-Use `seed_data.py` to preprocess datasets with R3M encoding for wrist images and other modalities.
+Use `seed_data.py` to preprocess transition files into raw-observation pickles. Images are stored as `uint8` tensors and encoded during training so the vision backbone can be finetuned end-to-end.
+
+Two preprocessing modes are supported:
+- `wrist_state`: wrist image + robot state
+- `full`: wrist image + tactile image + force vector + robot state
 
 ### Example: Preprocess wrist and state only
 ```bash
 python maniql/seed_data.py \
   --input-dir data \
-  --output data/preprocessed/all_transitions_r3m_wrist_state.pkl \
-  --features wrist,state \
-  --wrist-encoder r3m \
-  --wrist-model resnet50 \
-  --device cuda
+  --mode wrist_state \
+  --output data/preprocessed/raw_wrist_state.pkl
 ```
 
 ### Example: Preprocess wrist, tactile, forcefield, and state
 ```bash
 python maniql/seed_data.py \
   --input-dir data \
-  --output data/preprocessed/all_transitions_r3m_wrist_tactile_force_state.pkl \
-  --features wrist,tactile,forcefield,state \
-  --wrist-encoder r3m \
-  --wrist-model resnet18 \
-  --device cuda
+  --mode full \
+  --output data/preprocessed/raw_full.pkl
 ```
-
-Note: Tactile and forcefield modalities are processed using CNN and MLP respectively, trained with standard IQL loss.
 
 ## Training
 
-Train the ManiQL model using `train_iql.py`.
+Train the ManiQL model using `train_iql.py`. The `--backbone` flag selects the ResNet variant (`resnet18`, `resnet34`, or `resnet50`). Use `--r3m_checkpoint` to initialize the Flax backbone from pretrained R3M weights, or leave it empty to train from scratch.
 
-### Basic Training
+### Wrist + state
 ```bash
 python maniql/train_iql.py \
-  --dataset_path data/preprocessed/all_transitions_r3m18_wtfs.pkl \
-  --save_dir runs/manifeel_iql_multimodal \
-  --eval_episodes 10 \
+  --dataset_path data/preprocessed/raw_wrist_state.pkl \
+  --backbone resnet18 \
+  --r3m_checkpoint ~/.r3m/r3m_18/model.pt \
+  --save_dir runs/iql_ws_r3m18 \
+  --max_steps 200000 \
+  --batch_size 128 \
+  --normalize_rewards True
+```
+
+### Full multimodal
+```bash
+python maniql/train_iql.py \
+  --dataset_path data/preprocessed/raw_full.pkl \
+  --backbone resnet18 \
+  --r3m_checkpoint ~/.r3m/r3m_18/model.pt \
+  --save_dir runs/iql_full_r3m18 \
+  --max_steps 200000 \
+  --batch_size 64 \
   --normalize_rewards True
 ```
 
 ### Full Training Configuration
 ```bash
 python maniql/train_iql.py \
-  --dataset_path data/preprocessed/all_transitions_r3m18_wtfs.pkl \
-  --save_dir runs/manifeel_iql_r3m18_wtfs \
+  --dataset_path data/preprocessed/raw_full.pkl \
+  --backbone resnet18 \
+  --r3m_checkpoint ~/.r3m/r3m_18/model.pt \
+  --save_dir runs/iql_full_r3m18 \
   --max_steps 200000 \
-  --batch_size 128 \
+  --batch_size 64 \
   --eval_interval 2000 \
   --log_interval 1000 \
   --save_interval 50000 \
@@ -103,12 +117,12 @@ python maniql/train_iql.py \
 ### Debug Training (Small Steps)
 ```bash
 python maniql/train_iql.py \
-  --dataset_path data/preprocessed/all_transitions_r3m18_wtfs.pkl \
+  --dataset_path data/preprocessed/raw_wrist_state.pkl \
+  --backbone resnet18 \
   --save_dir runs/debug_small \
   --max_steps 1000 \
   --batch_size 32 \
-  --validate True \
-  --normalize_rewards False
+  --validate True
 ```
 
 ## Evaluation
@@ -126,5 +140,4 @@ Use the provided scripts in `maniql/` for evaluation and visualization, such as 
 pip install tqdm ml-collections jax "jax[cuda12]" 
 
 pip install jaxlib==0.4.13+cuda12.cudnn89 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-
 

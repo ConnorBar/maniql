@@ -1,15 +1,23 @@
-"""Multi-modal IQL networks: CNN for tactile, MLP for forcefield, trained end-to-end.
+"""Multi-modal IQL networks with R3M ResNet backbone finetuning.
 
-Architecture:
-  R3M wrist (dim from data)  -> passthrough
-  tactile (160,120,3)        -> CNN encoder -> 256
-  forcefield (420 flat)      -> MLP encoder -> 128
-  state (7)                  -> passthrough
+Architecture (end-to-end, finetuned during IQL training):
+  wrist  (224,224,3 uint8)  -> R3M ResNet  -> feature_dim
+  tactile (224,224,3 uint8) -> R3M ResNet  -> feature_dim   (full mode only)
+  force  (420 flat)         -> R3M ResNet  -> feature_dim   (full mode only)
+  state  (7)                -> passthrough
   Combined -> standard IQL MLP heads (value, critic, actor)
 
 Each IQL head (value, double-critic, actor) has its own encoder copy so
-gradients from each loss flow through a dedicated encoder.  This is the
-standard per-head approach and avoids gradient interference.
+gradients from each loss flow through a dedicated encoder.  The ResNet
+backbone is initialised from R3M pretrained weights and finetuned via IQL.
+
+Pipeline modes:
+  "wrist_state" : wrist + state
+  "full"        : wrist + tactile + force + state
+
+The backbone is model-agnostic -- swap ``arch`` to change from resnet18
+to resnet34/50 or replace ``FlaxResNet`` with any module that maps
+``(B, 224, 224, 3) -> (B, D)``.
 """
 
 import os
@@ -18,7 +26,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "implicit_q_learning"))
 
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import flax.linen as nn
 import jax
@@ -31,6 +39,11 @@ from common import MLP, Batch, InfoDict, Model, PRNGKey, Params, default_init
 from critic import update_q, update_v
 from actor import update as awr_update_actor
 import policy as iql_policy
+from vision_backbone import (
+    FlaxResNet, RESNET_OUT_DIM,
+    r3m_preprocess, force_to_image,
+    load_r3m_to_flax, load_r3m_checkpoint, inject_r3m_weights,
+)
 
 tfd = tfp.distributions
 tfb = tfp.bijectors
@@ -39,117 +52,82 @@ tfb = tfp.bijectors
 #  Observation constants
 # ---------------------------------------------------------------------------
 STATE_DIM = 7
-
-TACTILE_ENC_DIM = 256
-FORCEFIELD_ENC_DIM = 128
+FORCE_DIM = 420
 
 
-def multimodal_encoded_dim(wrist_dim: int) -> int:
-    """Encoder output size after tactile + forcefield CNN/MLP (wrist+state passthrough)."""
-    return wrist_dim + TACTILE_ENC_DIM + FORCEFIELD_ENC_DIM + STATE_DIM
-
-
-def infer_wrist_dim(metadata: Mapping[str, Any], obs_example: dict) -> int:
-    """Resolve wrist embedding width from pickle metadata and a batch-1 split observation.
-
-    ``obs["pass"]`` is wrist+state; ``metadata["obs_modality_spec"]["passthrough_order"]``
-    describes the ordering (default ``["wrist", "state"]``).
-    """
-    passthrough = obs_example["pass"]
-    pass_dim = int(np.asarray(passthrough).shape[-1])
-    spec = metadata.get("obs_modality_spec") or {}
-    order = spec.get("passthrough_order") or ["wrist", "state"]
-    if order == ["wrist"]:
-        return pass_dim
-    if set(order) <= {"wrist", "state"} and len(order) == 2:
-        return pass_dim - STATE_DIM
-    raise ValueError(
-        f"Cannot infer wrist_dim from passthrough_order={order!r}; "
-        "extend infer_wrist_dim if you add modalities to `pass`."
-    )
+def encoded_obs_dim(arch: str, mode: str) -> int:
+    """Total feature vector width after encoding all modalities."""
+    feat = RESNET_OUT_DIM[arch]
+    if mode == "wrist_state":
+        return feat + STATE_DIM
+    # full mode: wrist + tactile + force (all through ResNet) + state
+    return feat * 3 + STATE_DIM
 
 
 # ---------------------------------------------------------------------------
-#  Encoder modules
+#  Multi-modal observation encoder
 # ---------------------------------------------------------------------------
 
-class TactileEncoder(nn.Module):
-    """4-layer CNN with global average pooling for tactile images."""
-    out_dim: int = TACTILE_ENC_DIM
+class MultiModalEncoder(nn.Module):
+    """Encodes raw observations into a flat feature vector.
 
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # x: (B, 160, 120, 3)
-        x = nn.Conv(32, (3, 3), strides=(2, 2))(x)
-        x = nn.relu(x)
-        x = nn.Conv(64, (3, 3), strides=(2, 2))(x)
-        x = nn.relu(x)
-        x = nn.Conv(128, (3, 3), strides=(2, 2))(x)
-        x = nn.relu(x)
-        x = nn.Conv(256, (3, 3), strides=(2, 2))(x)
-        x = nn.relu(x)
-        x = jnp.mean(x, axis=(1, 2))          # global avg pool -> (B, 256)
-        x = nn.Dense(self.out_dim)(x)
-        x = nn.relu(x)
-        return x
+    Each image-like modality gets its own ``FlaxResNet`` (separate params,
+    independent gradient flow).  State is passed through as-is.
 
-
-class ForceFieldEncoder(nn.Module):
-    """Two-layer MLP encoder for flattened force field grid."""
-    out_dim: int = FORCEFIELD_ENC_DIM
-    hidden_dim: int = 256
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # x: (B, 420)
-        x = nn.Dense(self.hidden_dim)(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.out_dim)(x)
-        x = nn.relu(x)
-        return x
-
-
-class ObsEncoder(nn.Module):
-    """Encodes tactile + forcefield and concatenates with passthrough (wrist+state).
-
-    Expects a split-dict observation with keys
-    ``pass`` (passthrough), ``tact`` ``(B,H,W,C)``, ``forcefield`` ``(B,420)``.
+    Expects a dict observation with keys matching the pipeline mode:
+      wrist_state : ``{"wrist": (B,224,224,3), "state": (B,7)}``
+      full        : ``{"wrist": …, "tactile": …, "force": (B,420), "state": …}``
     """
-    wrist_dim: int
+    arch: str = "resnet18"
+    mode: str = "wrist_state"
 
     @nn.compact
     def __call__(self, observations: dict) -> jnp.ndarray:
-        passthrough = observations["pass"]
-        tactile = observations["tact"]
-        ff_flat = observations["forcefield"]
-        tac_feat = TactileEncoder()(tactile)
-        ff_feat = ForceFieldEncoder()(ff_flat)
-        return jnp.concatenate([passthrough, tac_feat, ff_feat], axis=-1)
+        wrist = r3m_preprocess(observations["wrist"])
+        wrist_feat = FlaxResNet(self.arch, name="wrist_backbone")(wrist)
+
+        parts = [wrist_feat]
+
+        if self.mode == "full":
+            tact = r3m_preprocess(observations["tactile"])
+            tact_feat = FlaxResNet(self.arch, name="tactile_backbone")(tact)
+            parts.append(tact_feat)
+
+            force_img = force_to_image(observations["force"])
+            force_feat = FlaxResNet(self.arch, name="force_backbone")(force_img)
+            parts.append(force_feat)
+
+        parts.append(observations["state"].astype(jnp.float32))
+        return jnp.concatenate(parts, axis=-1)
 
 
 # ---------------------------------------------------------------------------
-#  Multi-modal IQL network heads
+#  IQL network heads
 # ---------------------------------------------------------------------------
 
 class MMValueCritic(nn.Module):
     hidden_dims: Sequence[int]
-    wrist_dim: int
+    arch: str = "resnet18"
+    mode: str = "wrist_state"
 
     @nn.compact
     def __call__(self, observations) -> jnp.ndarray:
-        encoded = ObsEncoder(wrist_dim=self.wrist_dim)(observations)
+        encoded = MultiModalEncoder(self.arch, self.mode,
+                                    name="encoder")(observations)
         critic = MLP((*self.hidden_dims, 1))(encoded)
         return jnp.squeeze(critic, -1)
 
 
 class MMCritic(nn.Module):
     hidden_dims: Sequence[int]
-    wrist_dim: int
+    arch: str = "resnet18"
+    mode: str = "wrist_state"
     activations: callable = nn.relu
 
     @nn.compact
     def __call__(self, observations, actions: jnp.ndarray) -> jnp.ndarray:
-        encoded = ObsEncoder(wrist_dim=self.wrist_dim)(observations)
+        encoded = MultiModalEncoder(self.arch, self.mode,
+                                    name="encoder")(observations)
         inputs = jnp.concatenate([encoded, actions], -1)
         critic = MLP((*self.hidden_dims, 1),
                      activations=self.activations)(inputs)
@@ -158,22 +136,25 @@ class MMCritic(nn.Module):
 
 class MMDoubleCritic(nn.Module):
     hidden_dims: Sequence[int]
-    wrist_dim: int
+    arch: str = "resnet18"
+    mode: str = "wrist_state"
     activations: callable = nn.relu
 
     @nn.compact
-    def __call__(self, observations, actions: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        c1 = MMCritic(self.hidden_dims, self.wrist_dim, activations=self.activations)(
-            observations, actions)
-        c2 = MMCritic(self.hidden_dims, self.wrist_dim, activations=self.activations)(
-            observations, actions)
+    def __call__(self, observations,
+                 actions: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        c1 = MMCritic(self.hidden_dims, self.arch, self.mode,
+                      activations=self.activations)(observations, actions)
+        c2 = MMCritic(self.hidden_dims, self.arch, self.mode,
+                      activations=self.activations)(observations, actions)
         return c1, c2
 
 
 class MMNormalTanhPolicy(nn.Module):
     hidden_dims: Sequence[int]
-    wrist_dim: int
     action_dim: int
+    arch: str = "resnet18"
+    mode: str = "wrist_state"
     state_dependent_std: bool = True
     dropout_rate: Optional[float] = None
     log_std_scale: float = 1.0
@@ -185,7 +166,8 @@ class MMNormalTanhPolicy(nn.Module):
     def __call__(self, observations,
                  temperature: float = 1.0,
                  training: bool = False) -> tfd.Distribution:
-        encoded = ObsEncoder(wrist_dim=self.wrist_dim)(observations)
+        encoded = MultiModalEncoder(self.arch, self.mode,
+                                    name="encoder")(observations)
 
         outputs = MLP(self.hidden_dims, activate_final=True,
                       dropout_rate=self.dropout_rate)(encoded,
@@ -218,7 +200,7 @@ class MMNormalTanhPolicy(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-#  Multi-modal Learner -> implicit_q_learning/learner.py
+#  JIT-compiled update step (from implicit_q_learning/learner.py)
 # ---------------------------------------------------------------------------
 
 def _mm_target_update(critic: Model, target_critic: Model,
@@ -248,10 +230,18 @@ def _mm_update_jit(
     }
 
 
-class MultiModalLearner:
-    """IQL Learner with per-head CNN/MLP observation encoders.
+# ---------------------------------------------------------------------------
+#  Multi-modal Learner
+# ---------------------------------------------------------------------------
 
-    Exposes the same ``update(batch)`` and ``sample_actions(obs)`` API as
+class MultiModalLearner:
+    """IQL Learner with per-head ResNet observation encoders.
+
+    On construction the vision backbones are initialised from R3M pretrained
+    weights (if ``r3m_checkpoint`` is provided).  During training the
+    backbone is finetuned end-to-end via IQL loss gradients.
+
+    Exposes the same ``update(batch)`` / ``sample_actions(obs)`` API as
     ``learner.Learner``.
     """
 
@@ -260,7 +250,9 @@ class MultiModalLearner:
         seed: int,
         observations,
         actions: jnp.ndarray,
-        wrist_dim: int,
+        arch: str = "resnet18",
+        mode: str = "wrist_state",
+        r3m_checkpoint: Optional[str] = None,
         actor_lr: float = 3e-4,
         value_lr: float = 3e-4,
         critic_lr: float = 3e-4,
@@ -283,9 +275,17 @@ class MultiModalLearner:
 
         action_dim = actions.shape[-1]
 
+        # --- load R3M pretrained backbone params (once, requires torch) ---
+        r3m_params = None
+        if r3m_checkpoint is not None:
+            print(f"[INFO] Loading R3M weights from {r3m_checkpoint} "
+                  f"(arch={arch})")
+            pt_sd = load_r3m_checkpoint(r3m_checkpoint)
+            r3m_params = load_r3m_to_flax(pt_sd, arch=arch)
+
         # --- actor ---
         actor_def = MMNormalTanhPolicy(
-            hidden_dims, wrist_dim, action_dim,
+            hidden_dims, action_dim, arch=arch, mode=mode,
             log_std_scale=1e-3, log_std_min=-5.0,
             dropout_rate=dropout_rate,
             state_dependent_std=False,
@@ -301,13 +301,13 @@ class MultiModalLearner:
                              inputs=[actor_key, observations], tx=optimiser)
 
         # --- critic ---
-        critic_def = MMDoubleCritic(hidden_dims, wrist_dim=wrist_dim)
+        critic_def = MMDoubleCritic(hidden_dims, arch=arch, mode=mode)
         critic = Model.create(critic_def,
                               inputs=[critic_key, observations, actions],
                               tx=optax.adam(learning_rate=critic_lr))
 
         # --- value ---
-        value_def = MMValueCritic(hidden_dims, wrist_dim=wrist_dim)
+        value_def = MMValueCritic(hidden_dims, arch=arch, mode=mode)
         value = Model.create(value_def,
                              inputs=[value_key, observations],
                              tx=optax.adam(learning_rate=value_lr))
@@ -315,6 +315,18 @@ class MultiModalLearner:
         # --- target critic (no optimiser, soft-updated) ---
         target_critic = Model.create(critic_def,
                                      inputs=[critic_key, observations, actions])
+
+        # --- inject R3M pretrained weights into all backbones ---
+        if r3m_params is not None:
+            actor = actor.replace(
+                params=inject_r3m_weights(actor.params, r3m_params))
+            critic = critic.replace(
+                params=inject_r3m_weights(critic.params, r3m_params))
+            value = value.replace(
+                params=inject_r3m_weights(value.params, r3m_params))
+            target_critic = target_critic.replace(
+                params=inject_r3m_weights(target_critic.params, r3m_params))
+            print("[INFO] R3M backbone weights injected into all heads.")
 
         self.actor = actor
         self.critic = critic

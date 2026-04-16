@@ -1,13 +1,30 @@
-"""Offline IQL training on ManiFeel preprocessed datasets.
+"""Offline IQL training on ManiFeel datasets with R3M backbone finetuning.
 
-Usage:
-    python train_iql.py \
-        --dataset_path data/preprocessed/all_transitions_r3m_wrist_tactile_force_state.pkl \
-        --save_dir runs/manifeel_iql_multimodal \
+The vision backbone (FlaxResNet initialised from R3M pretrained weights)
+is finetuned end-to-end via IQL loss gradients.  Raw images are stored in
+the preprocessed pickle; encoding happens on-the-fly during training.
+
+Usage
+-----
+    # wrist + state (resnet18)
+    python train_iql.py \\
+        --dataset_path data/preprocessed/raw_wrist_state.pkl \\
+        --backbone resnet18 \\
+        --r3m_checkpoint ~/.r3m/r3m_18/model.pt \\
+        --save_dir runs/iql_ws_r3m18 \\
         --max_steps 200000
 
-    If you see CUDA_ERROR_OUT_OF_MEMORY, lower VRAM use with e.g.
-    ``--batch_size 128`` or ``64`` (default 256 is aggressive for 3 CNN encoders).
+    # full multimodal
+    python train_iql.py \\
+        --dataset_path data/preprocessed/raw_full.pkl \\
+        --backbone resnet18 \\
+        --r3m_checkpoint ~/.r3m/r3m_18/model.pt \\
+        --save_dir runs/iql_full_r3m18 \\
+        --max_steps 200000 \\
+        --batch_size 64
+
+    Lower ``--batch_size`` if you hit CUDA OOM -- each head has its own
+    ResNet backbone(s).
 """
 
 import os
@@ -20,7 +37,8 @@ import sys
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 # gets access to critic and learner modules
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "implicit_q_learning"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                                "implicit_q_learning"))
 
 import jax
 import jax.numpy as jnp
@@ -32,45 +50,52 @@ from tensorboardX import SummaryWriter
 
 from critic import loss as expectile_loss
 from manifeel_iql import ManiFeelDataset
-from multimodal_nets import MultiModalLearner, infer_wrist_dim
+from multimodal_nets import MultiModalLearner
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("dataset_path", "", "Path to ManiFeel preprocessed pickle.")
-flags.DEFINE_string("save_dir", "./runs/manifeel_iql/", "Tensorboard + checkpoint dir.")
+flags.DEFINE_string("dataset_path", "", "Path to preprocessed pickle.")
+flags.DEFINE_string("save_dir", "./runs/manifeel_iql/",
+                    "Tensorboard + checkpoint dir.")
+flags.DEFINE_string("backbone", "resnet18",
+                    "Vision backbone architecture (resnet18 / resnet34 / resnet50).")
+flags.DEFINE_string("r3m_checkpoint", "",
+                    "Path to R3M .pt checkpoint for backbone init. "
+                    "Leave empty to train from scratch.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_integer("log_interval", 1000, "Logging interval.")
 flags.DEFINE_integer("eval_interval", 2000, "Test-set evaluation interval.")
-flags.DEFINE_string(
-    "env_name",
-    "",
-    "Optional gym env for rollout eval (official IQL-style). "
-    "If empty, rollout evaluation is skipped.",
-)
-flags.DEFINE_integer("eval_episodes", 10, "Number of episodes for rollout evaluation.")
-flags.DEFINE_integer("batch_size", 256, "Mini batch size.")
-flags.DEFINE_integer("max_steps", int(1e6), "Number of gradient steps.")
-flags.DEFINE_integer("save_interval", 50000, "Checkpoint save interval (0 = final only).")
-flags.DEFINE_float("test_ratio", 0.1, "Fraction of episodes held out for test.")
+flags.DEFINE_string("env_name", "",
+                    "Optional gym env for rollout eval. "
+                    "If empty, rollout evaluation is skipped.")
+flags.DEFINE_integer("eval_episodes", 10, "Rollout episodes.")
+flags.DEFINE_integer("batch_size", 128, "Mini-batch size.")
+flags.DEFINE_integer("max_steps", int(1e6), "Gradient steps.")
+flags.DEFINE_integer("save_interval", 50000,
+                     "Checkpoint interval (0 = final only).")
+flags.DEFINE_float("test_ratio", 0.1, "Episode fraction held out for test.")
 flags.DEFINE_boolean("tqdm", True, "Use tqdm progress bar.")
-flags.DEFINE_boolean("normalize_rewards", False, "Normalize rewards by trajectory return range.")
+flags.DEFINE_boolean("normalize_rewards", False,
+                     "Normalize rewards by trajectory return range.")
 flags.DEFINE_boolean("clip_actions", True, "Clip actions to [-1+eps, 1-eps].")
-flags.DEFINE_boolean("validate", True, "Run data sanity checks before training.")
+flags.DEFINE_boolean("validate", True, "Run data sanity checks.")
 
 config_flags.DEFINE_config_file(
     "config",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "implicit_q_learning", "configs", "mujoco_config.py"),
-    "File path to the training hyperparameter configuration.",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "implicit_q_learning", "configs", "mujoco_config.py"),
+    "Training hyperparameter config.",
     lock_config=False,
 )
 
 
-# ---- eval losses (read-only, no gradient updates) -------------------------
+# ---------------------------------------------------------------------------
+#  Eval helpers
+# ---------------------------------------------------------------------------
 
 @jax.jit
 def _eval_losses(actor, critic, value, target_critic, batch,
                  discount, expectile, temperature, rng):
-    """Compute IQL losses on a batch without updating any parameters."""
     q1, q2 = target_critic(batch.observations, batch.actions)
     q = jnp.minimum(q1, q2)
     v = value(batch.observations)
@@ -80,7 +105,8 @@ def _eval_losses(actor, critic, value, target_critic, batch,
     next_v = value(batch.next_observations)
     target_q = batch.rewards + discount * batch.masks * next_v
     q1_pred, q2_pred = critic(batch.observations, batch.actions)
-    critic_loss = ((q1_pred - target_q) ** 2 + (q2_pred - target_q) ** 2).mean()
+    critic_loss = ((q1_pred - target_q) ** 2
+                   + (q2_pred - target_q) ** 2).mean()
 
     dist = actor.apply_fn.apply({"params": actor.params}, batch.observations)
     log_probs = dist.log_prob(batch.actions)
@@ -117,55 +143,52 @@ def eval_on_dataset(agent, dataset, batch_size, n_batches=10):
     return {k: v / n_batches for k, v in accum.items()}
 
 
-# ---- reward normalization -------------------------------------------------
+# ---------------------------------------------------------------------------
+#  Reward normalisation
+# ---------------------------------------------------------------------------
 
 def normalize_rewards(dataset: ManiFeelDataset):
-    """Normalize rewards by range of per-trajectory returns, scaled to 1000."""
     episode_returns = []
-    cur_return = 0.0
+    cur = 0.0
     for i in range(dataset.size):
-        cur_return += float(dataset.rewards[i])
+        cur += float(dataset.rewards[i])
         if dataset.dones_float[i] == 1.0:
-            episode_returns.append(cur_return)
-            cur_return = 0.0
-
+            episode_returns.append(cur)
+            cur = 0.0
     if len(episode_returns) < 2:
-        print("[WARN] <2 trajectories found, skipping reward normalization.")
+        print("[WARN] <2 trajectories, skipping reward normalisation.")
         return
-
     ret_range = max(episode_returns) - min(episode_returns)
     if ret_range < 1e-8:
-        print("[WARN] All trajectories have nearly identical returns, skipping normalization.")
+        print("[WARN] Flat returns, skipping normalisation.")
         return
-
     dataset.rewards /= ret_range
     dataset.rewards *= 1000.0
-    print(f"[INFO] Rewards normalized: range {ret_range:.4f} -> scaled to 1000.")
+    print(f"[INFO] Rewards normalised (range {ret_range:.4f} -> 1000).")
 
+
+# ---------------------------------------------------------------------------
+#  Checkpointing
+# ---------------------------------------------------------------------------
 
 def save_checkpoint(agent, save_dir: str, step: int):
-    ckpt_dir = os.path.join(save_dir, f"checkpoint_{step}")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    agent.actor.save(os.path.join(ckpt_dir, "actor.flax"))
-    agent.critic.save(os.path.join(ckpt_dir, "critic.flax"))
-    agent.value.save(os.path.join(ckpt_dir, "value.flax"))
+    ckpt = os.path.join(save_dir, f"checkpoint_{step}")
+    os.makedirs(ckpt, exist_ok=True)
+    agent.actor.save(os.path.join(ckpt, "actor.flax"))
+    agent.critic.save(os.path.join(ckpt, "critic.flax"))
+    agent.value.save(os.path.join(ckpt, "value.flax"))
 
 
-def _maybe_make_eval_env(env_name: str, seed: int):
-    """Best-effort gym env construction for rollout evaluation.
-
-    This mirrors the official IQL `train_offline.py` path (wrappers + evaluate)
-    but stays optional so ManiFeel training doesn't require gym/d4rl.
-    """
+def _maybe_make_eval_env(env_name, seed):
     if not env_name:
         print(f"[WARN] No environment name provided, skipping rollout evaluation.")
         return None, None
     try:
-        import gym  # type: ignore
-        import wrappers  # from implicit_q_learning/wrappers via sys.path insert
-        from evaluation import evaluate  # from implicit_q_learning
+        import gym
+        import wrappers
+        from evaluation import evaluate
     except Exception as e:
-        print(f"[WARN] Rollout eval disabled (missing deps): {e}")
+        print(f"[WARN] Rollout eval disabled: {e}")
         return None, None
 
     try:
@@ -177,9 +200,13 @@ def _maybe_make_eval_env(env_name: str, seed: int):
         env.observation_space.seed(seed)
         return env, evaluate
     except Exception as e:
-        print(f"[WARN] Failed to create rollout eval env {env_name!r}: {e}")
+        print(f"[WARN] Failed to create environment {env_name!r}: {e}")
         return None, None
 
+
+# ---------------------------------------------------------------------------
+#  Main
+# ---------------------------------------------------------------------------
 
 def main(_):
     if not FLAGS.dataset_path:
@@ -187,30 +214,28 @@ def main(_):
 
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     summary_writer = SummaryWriter(
-        os.path.join(FLAGS.save_dir, "tb", str(FLAGS.seed)), write_to_disk=True
+        os.path.join(FLAGS.save_dir, "tb", str(FLAGS.seed)),
+        write_to_disk=True,
     )
-
     np.random.seed(FLAGS.seed)
 
-    full_dataset = ManiFeelDataset(
-        FLAGS.dataset_path,
-        clip_actions=FLAGS.clip_actions,
-    )
+    # ---- load dataset ----
+    full_ds = ManiFeelDataset(
+        FLAGS.dataset_path, clip_actions=FLAGS.clip_actions)
 
-    wrist_dim = infer_wrist_dim(
-        full_dataset.metadata, full_dataset.observation_example()
-    )
-    print(f"[INFO] Inferred wrist_dim = {wrist_dim}")
+    mode = full_ds.mode
+    arch = FLAGS.backbone
+    r3m_ckpt = FLAGS.r3m_checkpoint or None
 
-    # Episode-level train/test split
-    train_ds, test_ds = full_dataset.train_test_split(
-        test_ratio=FLAGS.test_ratio, seed=FLAGS.seed
-    )
-    print("=== Train set ===")
+    print(f"[INFO] mode={mode}  backbone={arch}  "
+          f"r3m_checkpoint={r3m_ckpt or '(none, random init)'}")
+
+    train_ds, test_ds = full_ds.train_test_split(
+        test_ratio=FLAGS.test_ratio, seed=FLAGS.seed)
+    print("=== Train ===")
     print(train_ds.summary())
-    print(f"\n=== Test set ===")
+    print("=== Test ===")
     print(test_ds.summary())
-    print()
 
     if FLAGS.validate:
         print("--- Train validation ---")
@@ -223,13 +248,16 @@ def main(_):
         normalize_rewards(train_ds)
         normalize_rewards(test_ds)
 
+    # ---- build agent ----
     kwargs = dict(FLAGS.config)
     kwargs["max_steps"] = FLAGS.max_steps
     agent = MultiModalLearner(
         FLAGS.seed,
         train_ds.observation_example(),
         train_ds.actions[:1],
-        wrist_dim=wrist_dim,
+        arch=arch,
+        mode=mode,
+        r3m_checkpoint=r3m_ckpt,
         **kwargs,
     )
 
@@ -237,10 +265,14 @@ def main(_):
     eval_env, eval_fn = _maybe_make_eval_env(FLAGS.env_name, FLAGS.seed)
     eval_returns = []
 
-    print(f"[START] Training IQL (multi-modal CNN+MLP) for {FLAGS.max_steps:,} steps "
-          f"(batch={FLAGS.batch_size}, train={train_ds.size:,}, test={test_ds.size:,})")
+    print(f"[START] Training IQL (backbone={arch}, mode={mode}) "
+          f"for {FLAGS.max_steps:,} steps "
+          f"(batch={FLAGS.batch_size}, train={train_ds.size:,}, "
+          f"test={test_ds.size:,})")
 
-    for i in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm):
+    # ---- training loop ----
+    for i in tqdm.tqdm(range(1, FLAGS.max_steps + 1),
+                       smoothing=0.1, disable=not FLAGS.tqdm):
         batch = train_ds.sample(FLAGS.batch_size)
         update_info = agent.update(batch)
 
@@ -263,19 +295,18 @@ def main(_):
                 summary_writer.add_scalar(f"train_eval/{k}", v, i)
             summary_writer.flush()
 
-            # Optional: official IQL-style rollout evaluation when a simulator is available.
             if eval_env is not None and eval_fn is not None:
                 try:
-                    eval_stats = eval_fn(agent, eval_env, FLAGS.eval_episodes)
-                    for k, v in eval_stats.items():
-                        summary_writer.add_scalar(f"evaluation/average_{k}s", v, i)
+                    stats = eval_fn(agent, eval_env, FLAGS.eval_episodes)
+                    for k, v in stats.items():
+                        summary_writer.add_scalar(
+                            f"evaluation/average_{k}s", v, i)
                     summary_writer.flush()
-                    eval_returns.append((i, float(eval_stats.get("return", np.nan))))
+                    eval_returns.append(
+                        (i, float(stats.get("return", np.nan))))
                     np.savetxt(
                         os.path.join(FLAGS.save_dir, f"{FLAGS.seed}.txt"),
-                        eval_returns,
-                        fmt=["%d", "%.1f"],
-                    )
+                        eval_returns, fmt=["%d", "%.1f"])
                 except Exception as e:
                     print(f"[WARN] Rollout eval failed at step {i}: {e}")
 
@@ -284,7 +315,7 @@ def main(_):
 
     save_checkpoint(agent, FLAGS.save_dir, FLAGS.max_steps)
     summary_writer.close()
-    print(f"\n[DONE] Training complete.  Checkpoints saved to {FLAGS.save_dir}")
+    print(f"\n[DONE] Checkpoints in {FLAGS.save_dir}")
 
 
 if __name__ == "__main__":
