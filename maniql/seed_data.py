@@ -365,7 +365,7 @@ def main():
 
     metadata = {
         "mode": mode,
-        "split_keys": list[Literal['wrist', 'tactile', 'force', 'state']](split_keys),
+        "split_keys": list(split_keys),
         "image_size": args.image_size,
         "input_dir": str(input_dir),
         "input_glob": args.input_glob,
