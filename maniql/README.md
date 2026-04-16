@@ -26,6 +26,11 @@ python seed_data.py \
 The `--backbone` flag selects the ResNet variant (resnet18, resnet34, resnet50).
 `--r3m_checkpoint` loads pretrained R3M weights; omit to train from scratch.
 
+If you need to download the weights for the first time (stored in `/home/.r3m`):
+```bash
+cd maniql && python -c "import sys; sys.path.insert(0, 'r3m'); from r3m import load_r3m; load_r3m('resnet18')"
+```
+
 ### Wrist + State
 
 ```bash
