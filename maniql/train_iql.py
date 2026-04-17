@@ -25,10 +25,45 @@ Usage
 
     Lower ``--batch_size`` if you hit CUDA OOM -- each head has its own
     ResNet backbone(s).
+
+    GPU / cuDNN
+    ~~~~~~~~~~~
+    If you see ``CUDNN_STATUS_INTERNAL_ERROR`` or
+    ``DNN library initialization failed`` even when ``nvidia-smi`` shows free
+    memory, the JAX ``jaxlib`` wheel usually does not match the machine's CUDA
+    driver (or another library loaded a conflicting cuDNN). Fix the stack
+    (install the ``jax[cuda12]`` / ``jax[cuda11]`` variant that matches your
+    driver per JAX docs), or train on CPU::
+
+        python maniql/train_iql.py ... --jax_platform=cpu
+
+    Same effect: ``export JAX_PLATFORMS=cpu`` before launching (CPU is slow for
+    vision but verifies the rest of the pipeline).
 """
 
 import os
 import sys
+
+
+def _jax_platform_from_argv():
+    """Read ``--jax_platform`` before ``import jax`` (absl parses flags later)."""
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--jax_platform="):
+            return a.split("=", 1)[1].strip()
+        if a == "--jax_platform":
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                return argv[i + 1].strip()
+            return ""
+        i += 1
+    return None
+
+
+_jax_platform = _jax_platform_from_argv()
+if _jax_platform is not None and _jax_platform != "":
+    os.environ["JAX_PLATFORMS"] = _jax_platform
 
 # JAX defaults to grabbing most GPU VRAM up front; on WSL / smaller GPUs that
 # often causes CUDA OOM during peaks (multimodal IQL uses large tactile batches).
@@ -79,6 +114,13 @@ flags.DEFINE_boolean("normalize_rewards", False,
                      "Normalize rewards by trajectory return range.")
 flags.DEFINE_boolean("clip_actions", True, "Clip actions to [-1+eps, 1-eps].")
 flags.DEFINE_boolean("validate", True, "Run data sanity checks.")
+flags.DEFINE_string(
+    "jax_platform",
+    "",
+    "If set (e.g. cpu), exported as JAX_PLATFORMS before JAX loads CUDA/cuDNN. "
+    "Must be passed on the command line (not only in --config); "
+    "or use export JAX_PLATFORMS=cpu.",
+)
 
 config_flags.DEFINE_config_file(
     "config",

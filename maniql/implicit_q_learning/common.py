@@ -80,6 +80,11 @@ class Model:
     def apply_gradient(self, loss_fn) -> Tuple[Any, 'Model']:
         grad_fn = jax.grad(loss_fn, has_aux=True)
         grads, info = grad_fn(self.params)
+        # jax.grad often returns nested dicts; opt_state from tx.init(params) uses
+        # FrozenDict nodes when params are Flax FrozenDict. optax tree_map then
+        # raises "Custom node type mismatch" (seen on JAX 0.4.x + optax adam).
+        # Always freeze (idempotent for FrozenDict) so this stays correct under @jit.
+        grads = flax.core.freeze(grads)
 
         updates, new_opt_state = self.tx.update(grads, self.opt_state,
                                                 self.params)
