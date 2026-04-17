@@ -9,6 +9,7 @@ Key design decisions:
     and the correct block layout is selected automatically.
 """
 
+import os
 from typing import Any, Dict, Sequence, Tuple
 
 import flax.linen as nn
@@ -276,15 +277,30 @@ def load_r3m_to_flax(pytorch_state_dict: dict,
 
 
 def load_r3m_checkpoint(checkpoint_path: str) -> dict:
-    """Load an R3M ``.pt`` checkpoint and return the raw state-dict.
+    """Load an R3M checkpoint and return the raw vision state-dict.
 
-    This requires PyTorch to be installed (only used once at init time;
-    the rest of training is pure JAX).
+    * ``*.npz`` — NumPy arrays only (**no PyTorch**). Produce with
+      ``python maniql/convert_r3m_checkpoint_to_npz.py``.
+    * ``*.pt`` / ``*.pth`` — PyTorch ``torch.load`` (needs ``torch`` installed).
+      Training is still pure JAX; PyTorch is only used for this I/O if you
+      keep the original R3M file format.
     """
+    path = os.path.expanduser(checkpoint_path)
+    if path.endswith(".npz"):
+        with np.load(path, mmap_mode="r") as z:
+            return {
+                k: np.asarray(z[k])
+                for k in z.files
+                if "lang_enc" not in k and "lang_rew" not in k
+            }
+
     import torch
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location="cpu")
     sd = ckpt["r3m"] if "r3m" in ckpt else ckpt
-    # Strip language head entries (not needed for vision)
     return {k: v for k, v in sd.items()
             if "lang_enc" not in k and "lang_rew" not in k}
 

@@ -35,9 +35,10 @@ Usage
     (often pulled in with PyTorch) prepends another ``libcudnn`` and JAX breaks.
     Fix: ``pip uninstall nvidia-cudnn-cu12`` (PyTorch manylinux wheels usually
     bundle their own cuDNN), **or** upgrade ``jax``+``jaxlib`` to a wheel built
-    for cuDNN 9 (see JAX install docs; may need Python >= 3.9). A null
-    ``LD_LIBRARY_PATH`` does not prevent this — NVIDIA pip metapackages use
-    ``.pth`` entries. Or train on CPU::
+    for cuDNN 9 (see JAX install docs; may need Python >= 3.9). This script
+    prepends jaxlib's bundled ``libcudnn`` dirs to ``LD_LIBRARY_PATH`` on Linux
+    before importing JAX (disable with ``MANIQL_SKIP_JAXLIB_CUDNN_LD_PREPEND=1``).
+    Or train on CPU::
 
         python maniql/train_iql.py ... --jax_platform=cpu
 
@@ -78,6 +79,56 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 # Can avoid brittle cuDNN init when many CUDA libs are visible on LD_LIBRARY_PATH.
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
+
+def _prepend_jaxlib_bundled_cudnn_ld_path() -> None:
+    """Prefer jaxlib's own libcudnn*.so when pip ``nvidia-cudnn-cu12`` 9.x is also installed.
+
+    ``jaxlib`` wheels tagged ``cudnn89`` ship cuDNN 8.9; PyTorch often pulls
+    ``nvidia-cudnn-cu12`` 9.x into the same env. The dynamic linker can then
+    load the wrong major first. Prepending jaxlib's directories to
+    ``LD_LIBRARY_PATH`` (Linux only) fixes many of those cases without
+    uninstalling PyTorch deps. Set ``MANIQL_SKIP_JAXLIB_CUDNN_LD_PREPEND=1`` to
+    disable.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("MANIQL_SKIP_JAXLIB_CUDNN_LD_PREPEND", "").lower() in (
+            "1", "true", "yes"):
+        return
+    try:
+        from pathlib import Path
+        import site
+
+        search_roots: list[Path] = []
+        for sp in site.getsitepackages():
+            search_roots.append(Path(sp) / "jaxlib")
+        us = site.getusersitepackages()
+        if us:
+            search_roots.append(Path(us) / "jaxlib")
+
+        lib_dirs: list[str] = []
+        seen: set[str] = set()
+        for jaxlib in search_roots:
+            if not jaxlib.is_dir():
+                continue
+            for so in jaxlib.rglob("libcudnn.so*"):
+                if not so.is_file():
+                    continue
+                d = str(so.resolve().parent)
+                if d not in seen:
+                    seen.add(d)
+                    lib_dirs.append(d)
+        if not lib_dirs:
+            return
+        prev = os.environ.get("LD_LIBRARY_PATH", "")
+        prefix = ":".join(lib_dirs)
+        os.environ["LD_LIBRARY_PATH"] = f"{prefix}:{prev}" if prev else prefix
+    except Exception:
+        return
+
+
+_prepend_jaxlib_bundled_cudnn_ld_path()
+
 # gets access to critic and learner modules
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 
                                 "implicit_q_learning"))
@@ -111,11 +162,11 @@ def _print_jax_gpu_dnn_help() -> None:
                  pip show jax jaxlib  — reinstall from the official table so the
                  pip wheel matches CUDA 11 vs 12:
                  https://github.com/google/jax#installation
-              2) cuDNN version clash: jaxlib tag cudnn89 vs pip nvidia-cudnn-cu12 9.x.
+              2) cuDNN version clash: jaxlib cudnn89 vs pip nvidia-cudnn-cu12 9.x.
+                 train_iql prepends jaxlib's libcudnn dirs on Linux; if it still
+                 fails:  pip uninstall nvidia-cudnn-cu12
                  conda list | grep -iE 'cudnn|jaxlib'
-                 If you see both, try:  pip uninstall nvidia-cudnn-cu12
-                 (PyTorch often still works; if not, upgrade jax+jaxlib to a cuDNN9
-                 wheel or use a separate env for JAX training.)
+                 Or upgrade jax+jaxlib to a cuDNN9 wheel / separate env.
               3) Even if LD_LIBRARY_PATH is empty, RPATH / .pth can load another
                  libcudnn from $CONDA_PREFIX/lib. Remove mismatched cuda/cudnn
                  packages or use a clean venv.
@@ -263,6 +314,36 @@ def save_checkpoint(agent, save_dir: str, step: int):
     agent.actor.save(os.path.join(ckpt, "actor.flax"))
     agent.critic.save(os.path.join(ckpt, "critic.flax"))
     agent.value.save(os.path.join(ckpt, "value.flax"))
+    # Sentinel so rollout watchers know the checkpoint is fully written.
+    with open(os.path.join(ckpt, "DONE"), "w") as f:
+        f.write(str(step))
+
+
+def write_training_meta(save_dir: str, *, mode: str, arch: str,
+                        action_dim: int, hidden_dims, dataset_path: str,
+                        obs_example: dict, seed: int, batch_size: int,
+                        max_steps: int) -> str:
+    """Record everything a rollout watcher needs to reconstruct the policy."""
+    import json
+
+    obs_shapes = {k: list(v.shape) for k, v in obs_example.items()}
+    obs_dtypes = {k: str(v.dtype) for k, v in obs_example.items()}
+    meta = {
+        "mode": mode,
+        "arch": arch,
+        "action_dim": int(action_dim),
+        "hidden_dims": [int(h) for h in hidden_dims],
+        "dataset_path": dataset_path,
+        "obs_shapes": obs_shapes,
+        "obs_dtypes": obs_dtypes,
+        "seed": int(seed),
+        "batch_size": int(batch_size),
+        "max_steps": int(max_steps),
+    }
+    path = os.path.join(save_dir, "training_meta.json")
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+    return path
 
 
 def _maybe_make_eval_env(env_name, seed):
@@ -337,10 +418,11 @@ def main(_):
     # ---- build agent ----
     kwargs = dict(FLAGS.config)
     kwargs["max_steps"] = FLAGS.max_steps
+    obs_example = train_ds.observation_example()
     try:
         agent = MultiModalLearner(
             FLAGS.seed,
-            train_ds.observation_example(),
+            obs_example,
             train_ds.actions[:1],
             arch=arch,
             mode=mode,
@@ -351,6 +433,19 @@ def main(_):
         if _is_jax_gpu_dnn_init_failure(e):
             _print_jax_gpu_dnn_help()
         raise
+
+    write_training_meta(
+        FLAGS.save_dir,
+        mode=mode,
+        arch=arch,
+        action_dim=int(train_ds.actions.shape[-1]),
+        hidden_dims=kwargs.get("hidden_dims", (256, 256)),
+        dataset_path=os.path.abspath(FLAGS.dataset_path),
+        obs_example=obs_example,
+        seed=FLAGS.seed,
+        batch_size=FLAGS.batch_size,
+        max_steps=FLAGS.max_steps,
+    )
 
     # passthrough until i implement isaac gym connection
     eval_env, eval_fn = _maybe_make_eval_env(FLAGS.env_name, FLAGS.seed)

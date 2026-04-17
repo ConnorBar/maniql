@@ -275,7 +275,7 @@ class MultiModalLearner:
 
         action_dim = actions.shape[-1]
 
-        # --- load R3M pretrained backbone params (once, requires torch) ---
+        # --- load R3M pretrained backbone params (once; .npz needs no torch) ---
         r3m_params = None
         if r3m_checkpoint is not None:
             print(f"[INFO] Loading R3M weights from {r3m_checkpoint} "
