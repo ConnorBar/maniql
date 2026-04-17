@@ -30,10 +30,14 @@ Usage
     ~~~~~~~~~~~
     If you see ``CUDNN_STATUS_INTERNAL_ERROR`` or
     ``DNN library initialization failed`` even when ``nvidia-smi`` shows free
-    memory, the JAX ``jaxlib`` wheel usually does not match the machine's CUDA
-    driver (or another library loaded a conflicting cuDNN). Fix the stack
-    (install the ``jax[cuda12]`` / ``jax[cuda11]`` variant that matches your
-    driver per JAX docs), or train on CPU::
+    memory, check for **two cuDNN majors** in one env. Example: ``jaxlib`` tag
+    ``+cuda12.cudnn89`` needs cuDNN **8.9**, but pip ``nvidia-cudnn-cu12`` **9.x**
+    (often pulled in with PyTorch) prepends another ``libcudnn`` and JAX breaks.
+    Fix: ``pip uninstall nvidia-cudnn-cu12`` (PyTorch manylinux wheels usually
+    bundle their own cuDNN), **or** upgrade ``jax``+``jaxlib`` to a wheel built
+    for cuDNN 9 (see JAX install docs; may need Python >= 3.9). A null
+    ``LD_LIBRARY_PATH`` does not prevent this — NVIDIA pip metapackages use
+    ``.pth`` entries. Or train on CPU::
 
         python maniql/train_iql.py ... --jax_platform=cpu
 
@@ -43,6 +47,7 @@ Usage
 
 import os
 import sys
+import textwrap
 
 
 def _jax_platform_from_argv():
@@ -70,6 +75,8 @@ if _jax_platform is not None and _jax_platform != "":
 # Override with XLA_PYTHON_CLIENT_PREALLOCATE=true if you prefer the default.
 # this is the main reason that fixed the OOM issue
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Can avoid brittle cuDNN init when many CUDA libs are visible on LD_LIBRARY_PATH.
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
 # gets access to critic and learner modules
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 
@@ -86,6 +93,43 @@ from tensorboardX import SummaryWriter
 from critic import loss as expectile_loss
 from manifeel_iql import ManiFeelDataset
 from multimodal_nets import MultiModalLearner
+
+
+def _is_jax_gpu_dnn_init_failure(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        s in text
+        for s in ("dnn library", "cudnn_status", "cuda_dnn", "cudnn"))
+
+
+def _print_jax_gpu_dnn_help() -> None:
+    print(
+        textwrap.dedent(
+            """
+            [HINT] GPU cuDNN init failed (not an application bug in train_iql).
+              1) Compare driver vs JAX:  nvidia-smi  (CUDA version line)  and
+                 pip show jax jaxlib  — reinstall from the official table so the
+                 pip wheel matches CUDA 11 vs 12:
+                 https://github.com/google/jax#installation
+              2) cuDNN version clash: jaxlib tag cudnn89 vs pip nvidia-cudnn-cu12 9.x.
+                 conda list | grep -iE 'cudnn|jaxlib'
+                 If you see both, try:  pip uninstall nvidia-cudnn-cu12
+                 (PyTorch often still works; if not, upgrade jax+jaxlib to a cuDNN9
+                 wheel or use a separate env for JAX training.)
+              3) Even if LD_LIBRARY_PATH is empty, RPATH / .pth can load another
+                 libcudnn from $CONDA_PREFIX/lib. Remove mismatched cuda/cudnn
+                 packages or use a clean venv.
+              4) See which libcudnn jaxlib loads (Linux): run
+                   python -c "import jaxlib, os; print(os.path.dirname(jaxlib.__file__))"
+                 then in that directory  ldd xla_extension*.so  | grep -i cudnn
+                 (if the .so name differs, ldd whichever extension jaxlib ships.)
+              5) Reinstall jax + jaxlib together from the JAX install table.
+              6) Unblock training without GPU:  --jax_platform=cpu
+            """
+        ).strip(),
+        file=sys.stderr,
+    )
+
 
 FLAGS = flags.FLAGS
 
@@ -293,15 +337,20 @@ def main(_):
     # ---- build agent ----
     kwargs = dict(FLAGS.config)
     kwargs["max_steps"] = FLAGS.max_steps
-    agent = MultiModalLearner(
-        FLAGS.seed,
-        train_ds.observation_example(),
-        train_ds.actions[:1],
-        arch=arch,
-        mode=mode,
-        r3m_checkpoint=r3m_ckpt,
-        **kwargs,
-    )
+    try:
+        agent = MultiModalLearner(
+            FLAGS.seed,
+            train_ds.observation_example(),
+            train_ds.actions[:1],
+            arch=arch,
+            mode=mode,
+            r3m_checkpoint=r3m_ckpt,
+            **kwargs,
+        )
+    except Exception as e:
+        if _is_jax_gpu_dnn_init_failure(e):
+            _print_jax_gpu_dnn_help()
+        raise
 
     # passthrough until i implement isaac gym connection
     eval_env, eval_fn = _maybe_make_eval_env(FLAGS.env_name, FLAGS.seed)
