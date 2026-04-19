@@ -6,16 +6,15 @@ import argparse
 import json
 import os
 import random
-from dataclasses import asdict
 from typing import Dict
 
 import numpy as np
 import torch
 import tqdm
-from torch.utils.tensorboard import SummaryWriter
 
 from manifeel_iql import ManiFeelDataset
 from multimodal_nets import IQLLearner
+from log_utils import init_wandb, setup_logging, wandb_log, write_jsonl
 
 
 def set_seed(seed: int) -> None:
@@ -53,6 +52,7 @@ def eval_on_dataset(agent: IQLLearner, dataset: ManiFeelDataset, batch_size: int
     q_means: list[float] = []
     v_means: list[float] = []
     adv_means: list[float] = []
+
     for _ in range(n_batches):
         b = dataset.sample(batch_size)
         info = agent.compute_losses(b)
@@ -138,32 +138,40 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tau", type=float, default=0.005)
     p.add_argument("--expectile", type=float, default=0.8)
     p.add_argument("--temperature", type=float, default=0.1)
+    # Logging / W&B
+    p.add_argument("--wandb", action="store_true", default=False, help="Enable Weights & Biases logging.")
+    p.add_argument("--wandb_project", default="torch-maniql")
+    p.add_argument("--wandb_entity", default="", help="W&B entity/team (optional).")
+    p.add_argument("--wandb_name", default="", help="W&B run name (optional).")
+    p.add_argument("--wandb_group", default="", help="W&B group (optional).")
+    p.add_argument("--wandb_tags", nargs="*", default=[], help="W&B tags (optional).")
+    p.add_argument("--wandb_mode", default="online", choices=["online", "offline", "disabled"])
+    p.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
+    logger = setup_logging(args.save_dir, level=args.log_level)
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] device={device}")
+    logger.info("device=%s", device)
 
     full_ds = ManiFeelDataset(args.dataset_path, clip_actions=args.clip_actions)
     mode = full_ds.mode
     arch = args.backbone
     r3m_ckpt = args.r3m_checkpoint or None
-    print(f"[INFO] mode={mode} backbone={arch} r3m_checkpoint={r3m_ckpt or '(none)'}")
+    logger.info("mode=%s backbone=%s r3m_checkpoint=%s", mode, arch, r3m_ckpt or "(none)")
 
     train_ds, test_ds = full_ds.train_test_split(test_ratio=args.test_ratio, seed=args.seed)
-    print("=== Train ===")
-    print(train_ds.summary())
-    print("=== Test ===")
-    print(test_ds.summary())
+    logger.info("=== Train ===\n%s", train_ds.summary())
+    logger.info("=== Test ===\n%s", test_ds.summary())
     if args.validate:
-        print("--- Train validation ---")
+        logger.info("--- Train validation ---")
         train_ds.validate()
-        print("--- Test validation ---")
+        logger.info("--- Test validation ---")
         test_ds.validate()
 
     if args.normalize_rewards:
@@ -190,7 +198,7 @@ def main() -> None:
         temperature=args.temperature,
     )
 
-    write_training_meta(
+    meta_path = write_training_meta(
         args.save_dir,
         mode=mode,
         arch=arch,
@@ -202,10 +210,26 @@ def main() -> None:
         batch_size=args.batch_size,
         max_steps=args.max_steps,
     )
+    wandb = init_wandb(
+        enabled=bool(args.wandb) and args.wandb_mode != "disabled",
+        project=args.wandb_project,
+        entity=args.wandb_entity or None,
+        name=args.wandb_name or None,
+        group=args.wandb_group or None,
+        tags=args.wandb_tags or None,
+        mode=args.wandb_mode,
+        save_dir=args.save_dir,
+        config=vars(args),
+    )
+    if wandb is not None:
+        try:
+            wandb.save(meta_path)
+        except Exception:
+            pass
 
-    writer = SummaryWriter(os.path.join(args.save_dir, "tb", str(args.seed)))
+    metrics_path = os.path.join(args.save_dir, "metrics", "metrics.jsonl")
 
-    print(f"[START] Training IQL for {args.max_steps:,} steps (batch={args.batch_size})")
+    logger.info("[START] Training IQL for %s steps (batch=%s)", f"{args.max_steps:,}", args.batch_size)
     it = range(1, args.max_steps + 1)
     if args.tqdm:
         it = tqdm.tqdm(it, smoothing=0.1)
@@ -215,28 +239,56 @@ def main() -> None:
         info = agent.update(batch)
 
         if step % args.log_interval == 0:
-            writer.add_scalar("train/actor_loss", info.actor_loss, step)
-            writer.add_scalar("train/critic_loss", info.critic_loss, step)
-            writer.add_scalar("train/value_loss", info.value_loss, step)
-            writer.add_scalar("train/q", info.q_mean, step)
-            writer.add_scalar("train/v", info.v_mean, step)
-            writer.add_scalar("train/adv", info.adv_mean, step)
-            writer.add_scalar("train/backbone_grad_norm", info.backbone_grad_norm, step)
-            writer.flush()
+            train_metrics = {
+                "train/actor_loss": float(info.actor_loss),
+                "train/critic_loss": float(info.critic_loss),
+                "train/value_loss": float(info.value_loss),
+                "train/q": float(info.q_mean),
+                "train/v": float(info.v_mean),
+                "train/adv": float(info.adv_mean),
+                "train/backbone_grad_norm": float(info.backbone_grad_norm),
+            }
+            wandb_log(wandb, train_metrics, step=step)
+            write_jsonl(metrics_path, {"step": int(step), **train_metrics})
+            logger.info(
+                "step=%d actor=%.6f critic=%.6f value=%.6f q=%.4f v=%.4f adv=%.4f grad=%.4f",
+                step,
+                train_metrics["train/actor_loss"],
+                train_metrics["train/critic_loss"],
+                train_metrics["train/value_loss"],
+                train_metrics["train/q"],
+                train_metrics["train/v"],
+                train_metrics["train/adv"],
+                train_metrics["train/backbone_grad_norm"],
+            )
 
         if step % args.eval_interval == 0:
             # Note: current eval uses agent.update() for metric computation; keep eval_interval large.
             test_info = eval_on_dataset(agent, test_ds, args.batch_size, n_batches=5)
-            for k, v in test_info.items():
-                writer.add_scalar(f"test/{k}", v, step)
-            writer.flush()
+            test_metrics = {f"test/{k}": float(v) for k, v in test_info.items()}
+            wandb_log(wandb, test_metrics, step=step)
+            write_jsonl(metrics_path, {"step": int(step), **test_metrics})
+            logger.info(
+                "eval step=%d actor=%.6f critic=%.6f value=%.6f q=%.4f v=%.4f adv=%.4f",
+                step,
+                test_metrics["test/actor_loss"],
+                test_metrics["test/critic_loss"],
+                test_metrics["test/value_loss"],
+                test_metrics["test/q"],
+                test_metrics["test/v"],
+                test_metrics["test/adv"],
+            )
 
         if args.save_interval > 0 and step % args.save_interval == 0:
             save_checkpoint(agent, args.save_dir, step)
 
     save_checkpoint(agent, args.save_dir, args.max_steps)
-    writer.close()
-    print(f"[DONE] Checkpoints in {args.save_dir}")
+    if wandb is not None:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
+    logger.info("[DONE] Checkpoints in %s", args.save_dir)
 
 
 if __name__ == "__main__":

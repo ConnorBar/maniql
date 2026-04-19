@@ -8,7 +8,6 @@ dependencies:
   - pip
   - numpy
   - tqdm
-  - tensorboard
   - pytorch
   - torchvision
   # Pick a CUDA runtime that matches your driver/tooling. If IsaacGym forces a
@@ -16,4 +15,5 @@ dependencies:
   - pytorch-cuda=12
   - pip:
       - absl-py
+      - wandb
       - -e ./r3m

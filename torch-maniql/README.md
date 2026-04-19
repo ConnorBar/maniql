@@ -34,7 +34,7 @@ cd maniql && python -c "import sys; sys.path.insert(0, 'r3m'); from r3m import l
 ### Wrist + State
 
 ```bash
-python maniql/train_iql.py \
+python torch-maniql/train_iql.py \
   --dataset_path data/preprocessed/raw_wrist_state.pkl \
   --backbone resnet18 \
   --r3m_checkpoint ~/.r3m/r3m_18/model.pt \
@@ -44,10 +44,30 @@ python maniql/train_iql.py \
   --normalize_rewards True
 ```
 
+#### Logging / W&B
+
+By default training writes:
+- logs to `runs/<exp>/logs/*.log`
+- metrics (JSONL) to `runs/<exp>/metrics/metrics.jsonl`
+
+To enable Weights & Biases logging:
+
+```bash
+python torch-maniql/train_iql.py \
+  --dataset_path data/preprocessed/raw_wrist_state.pkl \
+  --save_dir runs/iql_ws_r3m18 \
+  --wandb \
+  --wandb_project torch-maniql \
+  --wandb_entity <your_entity_optional> \
+  --wandb_name iql_ws_r3m18
+```
+
+If you want to avoid network access, use `--wandb_mode offline`.
+
 ### Full multimodal
 
 ```bash
-python maniql/train_iql.py \
+python torch-maniql/train_iql.py \
   --dataset_path data/preprocessed/raw_full.pkl \
   --backbone resnet18 \
   --r3m_checkpoint ~/.r3m/r3m_18/model.pt \
@@ -60,7 +80,7 @@ python maniql/train_iql.py \
 ### Debug (small run)
 
 ```bash
-python maniql/train_iql.py \
+python torch-maniql/train_iql.py \
   --dataset_path data/preprocessed/raw_wrist_state.pkl \
   --backbone resnet18 \
   --save_dir runs/debug_small \

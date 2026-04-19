@@ -14,9 +14,9 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
 
 from multimodal_nets import DiagGaussianPolicy
+from log_utils import init_wandb, setup_logging, wandb_log, write_jsonl
 
 
 def _parse_args() -> argparse.Namespace:
@@ -34,6 +34,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=-1, help="Rollout seed (-1 = reuse training seed).")
     p.add_argument("--once", action="store_true", default=False)
     p.add_argument("--traj_dir", default="", help="Where to write .npz trajectories (default: <save_dir>/trajectories).")
+    # Logging / W&B
+    p.add_argument("--wandb", action="store_true", default=False, help="Enable Weights & Biases logging.")
+    p.add_argument("--wandb_project", default="torch-maniql")
+    p.add_argument("--wandb_entity", default="", help="W&B entity/team (optional).")
+    p.add_argument("--wandb_name", default="", help="W&B run name (optional).")
+    p.add_argument("--wandb_group", default="", help="W&B group (optional).")
+    p.add_argument("--wandb_tags", nargs="*", default=[], help="W&B tags (optional).")
+    p.add_argument("--wandb_mode", default="online", choices=["online", "offline", "disabled"])
+    p.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
 
 
@@ -228,13 +237,26 @@ def _run_episodes(
 
 
 def main() -> None:
+    logger = setup_logging(ARGS.save_dir, name="torch-maniql.rollout", level=ARGS.log_level)
     meta = _await_meta(ARGS.save_dir, ARGS.poll_interval)
     if meta.get("backend") != "pytorch":
         raise SystemExit(f"training_meta.json backend={meta.get('backend')} not supported; expected 'pytorch'")
 
-    print(f"[INFO] Loaded training_meta.json: mode={meta['mode']} arch={meta['arch']} action_dim={meta['action_dim']}")
+    logger.info("Loaded training_meta.json: mode=%s arch=%s action_dim=%s", meta["mode"], meta["arch"], meta["action_dim"])
 
-    writer = SummaryWriter(os.path.join(ARGS.save_dir, "tb", str(ARGS.seed if ARGS.seed >= 0 else meta.get("seed", 0))))
+    wandb = init_wandb(
+        enabled=bool(ARGS.wandb) and ARGS.wandb_mode != "disabled",
+        project=ARGS.wandb_project,
+        entity=ARGS.wandb_entity or None,
+        name=ARGS.wandb_name or None,
+        group=ARGS.wandb_group or None,
+        tags=ARGS.wandb_tags or None,
+        mode=ARGS.wandb_mode,
+        save_dir=ARGS.save_dir,
+        config={**vars(ARGS), **{"training_meta": meta}},
+    )
+    metrics_path = os.path.join(ARGS.save_dir, "metrics", "eval_metrics.jsonl")
+
     env = _make_isaac_env()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     traj_dir = ARGS.traj_dir or os.path.join(ARGS.save_dir, "trajectories")
@@ -251,11 +273,11 @@ def main() -> None:
                 continue
 
             for step, path in new:
-                print(f"[EVAL] step={step} checkpoint={path}")
+                logger.info("[EVAL] step=%d checkpoint=%s", step, path)
                 try:
                     actor = _load_actor(meta, path, device=device)
                 except Exception as e:
-                    print(f"[WARN] Failed to load checkpoint {path}: {e}")
+                    logger.warning("Failed to load checkpoint %s: %s", path, e)
                     seen.add(step)
                     continue
 
@@ -271,27 +293,34 @@ def main() -> None:
                         device=device,
                     )
                 except Exception as e:
-                    print(f"[WARN] Rollout failed at step {step}: {e}")
+                    logger.warning("Rollout failed at step %d: %s", step, e)
                     seen.add(step)
                     continue
 
-                print(
-                    f"[EVAL] step={step} success={stats['success_rate']:.3f} "
-                    f"return={stats['return_mean']:.3f}±{stats['return_std']:.3f} "
-                    f"len={stats['episode_length_mean']:.1f} n={stats['n_episodes']} "
-                    f"traj={stats['trajectory_file']}"
+                logger.info(
+                    "[EVAL] step=%d success=%.3f return=%.3f±%.3f len=%.1f n=%d traj=%s",
+                    step,
+                    float(stats["success_rate"]),
+                    float(stats["return_mean"]),
+                    float(stats["return_std"]),
+                    float(stats["episode_length_mean"]),
+                    int(stats["n_episodes"]),
+                    stats["trajectory_file"],
                 )
 
-                for k, v in stats.items():
-                    if isinstance(v, (int, float, np.floating)):
-                        writer.add_scalar(f"evaluation/{k}", float(v), step)
-                writer.flush()
+                eval_metrics = {f"evaluation/{k}": v for k, v in stats.items() if isinstance(v, (int, float, np.floating))}
+                wandb_log(wandb, eval_metrics, step=step)
+                write_jsonl(metrics_path, {"step": int(step), **{k: float(v) for k, v in eval_metrics.items()}})
                 seen.add(step)
 
             if ARGS.once:
                 break
     finally:
-        writer.close()
+        if wandb is not None:
+            try:
+                wandb.finish()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
