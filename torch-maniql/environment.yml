@@ -1,0 +1,19 @@
+name: torch-maniql
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pip
+  - numpy
+  - tqdm
+  - tensorboard
+  - pytorch
+  - torchvision
+  # Pick a CUDA runtime that matches your driver/tooling. If IsaacGym forces a
+  # specific PyTorch build, adjust these two lines accordingly.
+  - pytorch-cuda=12
+  - pip:
+      - absl-py
+      - -e ./r3m
