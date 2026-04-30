@@ -272,7 +272,7 @@ class IQLLearner:
 
         # --- target critic EMA ---
         with torch.no_grad():
-            for p, tp in zip(self.critic.parameters(), self.target_critic.parameters(), strict=True):
+            for p, tp in zip(self.critic.parameters(), self.target_critic.parameters()):
                 tp.data.mul_(1.0 - self.tau).add_(p.data, alpha=self.tau)
 
         return IQLInfo(
