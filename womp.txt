@@ -31,3 +31,27 @@ python train.py task=Cartpole \
 export WANDB_ENTITY=cbarnsle-purdue-university
 export WANDB_PROJECT=isaacgym-cartpole
 python train.py task=Cartpole
+
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.163.01             Driver Version: 550.163.01     CUDA Version: 12.4     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        Off |   00000000:01:00.0  On |                  Off |
+| 55%   75C    P2            321W /  450W |    5811MiB /  24564MiB |     93%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A      2708      G   /usr/lib/xorg/Xorg                            248MiB |
+|    0   N/A  N/A      2883      G   /usr/bin/gnome-shell                           55MiB |
+|    0   N/A  N/A      3641      G   /usr/share/code/code                          133MiB |
+|    0   N/A  N/A      4321      G   ...n=20260427-090052.211000-production         59MiB |
+|    0   N/A  N/A    219664    C+G   python                                       5232MiB |
++-----------------------------------------------------------------------------------------+
