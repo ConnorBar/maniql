@@ -11,8 +11,13 @@ during the forward pass (via ``r3m_preprocess``).
 
 import collections
 import pickle
+import sys
 
 import numpy as np
+
+# Pickle files saved with NumPy 2.x reference numpy._core, which doesn't exist in 1.x
+if not hasattr(np, '_core'):
+    sys.modules.setdefault('numpy._core', np.core)  # type: ignore[attr-defined]
 
 from obs_modality import IMAGE_KEYS, get_split_keys
 
