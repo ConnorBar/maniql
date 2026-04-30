@@ -56,11 +56,10 @@ def parse_args():
                     "backbone finetuning)."
     )
     p.add_argument("--input-dir", type=str,
-                   default="/home/connors/capstone/data")
+                   default="data")
     p.add_argument("--input-glob", type=str, default="*_transitions.pkl")
     p.add_argument("--output", type=str,
-                   default="/home/connors/capstone/data/preprocessed/"
-                           "all_transitions_raw.pkl")
+                   default="data/preprocessed/all_transitions_raw.pkl")
     p.add_argument("--mode", type=str, default="wrist_state",
                    choices=["wrist_state", "full"],
                    help="Pipeline mode: 'wrist_state' or 'full'.")

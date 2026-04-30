@@ -46,7 +46,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-ARGS = _parse_args()
+ARGS = None  # populated in main()
 
 
 def _list_ready_checkpoints(save_dir: str) -> List[Tuple[int, str]]:
@@ -237,6 +237,8 @@ def _run_episodes(
 
 
 def main() -> None:
+    global ARGS
+    ARGS = _parse_args()
     logger = setup_logging(ARGS.save_dir, name="torch-maniql.rollout", level=ARGS.log_level)
     meta = _await_meta(ARGS.save_dir, ARGS.poll_interval)
     if meta.get("backend") != "pytorch":
