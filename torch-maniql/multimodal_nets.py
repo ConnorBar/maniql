@@ -175,6 +175,9 @@ class IQLInfo:
     v_mean: float
     adv_mean: float
     backbone_grad_norm: float
+    awr_weight_mean: float
+    awr_weight_max: float
+    encoder_lr: float
 
 
 class IQLLearner:
@@ -346,6 +349,9 @@ class IQLLearner:
             v_mean=float(v.mean().detach().cpu()),
             adv_mean=float(adv.mean().detach().cpu()),
             backbone_grad_norm=grad_norm,
+            awr_weight_mean=float(weights.mean().detach().cpu()),
+            awr_weight_max=float(weights.max().detach().cpu()),
+            encoder_lr=self.encoder_opt.param_groups[0]["lr"],
         )
 
     @torch.no_grad()

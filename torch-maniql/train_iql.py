@@ -261,6 +261,9 @@ def main() -> None:
                 "train/v": float(info.v_mean),
                 "train/adv": float(info.adv_mean),
                 "train/backbone_grad_norm": float(info.backbone_grad_norm),
+                "train/awr_weight_mean": float(info.awr_weight_mean),
+                "train/awr_weight_max": float(info.awr_weight_max),
+                "train/encoder_lr": float(info.encoder_lr),
             }
             wandb_log(wandb, train_metrics, step=step)
             write_jsonl(metrics_path, {"step": int(step), **train_metrics})
