@@ -2,6 +2,11 @@
 
 Eval-only: rollouts do not feed back into training. This script also saves
 trajectories to disk (one file per checkpoint) for later visualization.
+
+Video recording:
+    --record_video saves wrist camera frames as MP4 for each episode.
+    Works headless (no display needed). Requires imageio[ffmpeg]:
+        pip install imageio[ffmpeg]
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ import argparse
 import json
 import os
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -34,6 +39,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=-1, help="Rollout seed (-1 = reuse training seed).")
     p.add_argument("--once", action="store_true", default=False)
     p.add_argument("--traj_dir", default="", help="Where to write .npz trajectories (default: <save_dir>/trajectories).")
+    p.add_argument("--record_video", action="store_true", default=False, help="Save wrist camera frames as MP4 videos.")
+    p.add_argument("--video_fps", type=int, default=30, help="FPS for saved videos.")
+    p.add_argument("--video_episodes", type=int, default=3, help="How many episodes to record per checkpoint (saves disk).")
     # Logging / W&B
     p.add_argument("--wandb", action="store_true", default=False, help="Enable Weights & Biases logging.")
     p.add_argument("--wandb_project", default="torch-maniql")
@@ -156,6 +164,37 @@ def _load_actor(meta: dict, checkpoint_dir: str, device: torch.device) -> Tuple[
     return encoder, actor
 
 
+def _save_video(frames: List[np.ndarray], path: str, fps: int = 30) -> None:
+    """Write a list of uint8 HWC frames to an MP4 file."""
+    try:
+        import imageio.v2 as iio
+    except ImportError:
+        try:
+            import imageio as iio
+        except ImportError:
+            print(f"[WARN] imageio not installed, skipping video save: {path}")
+            return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    writer = iio.get_writer(path, fps=fps, codec="libx264", quality=8)
+    for frame in frames:
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame * 255, 0, 255).astype(np.uint8)
+        writer.append_data(frame)
+    writer.close()
+
+
+def _extract_wrist_frame(pobs: Dict[str, np.ndarray]) -> Optional[np.ndarray]:
+    """Pull a single HWC uint8 wrist frame from the policy obs dict."""
+    if "wrist" not in pobs:
+        return None
+    img = pobs["wrist"]
+    if img.ndim == 4:
+        img = img[0]
+    if img.dtype != np.uint8:
+        img = np.clip(img * 255, 0, 255).astype(np.uint8)
+    return img
+
+
 def _run_episodes(
     encoder: MultiModalEncoder,
     actor: PolicyHead,
@@ -167,16 +206,21 @@ def _run_episodes(
     traj_dir: str,
     step: int,
     device: torch.device,
+    record_video: bool = False,
+    video_fps: int = 30,
+    video_episodes: int = 3,
 ) -> dict:
     returns: List[float] = []
     successes: List[float] = []
     lengths: List[int] = []
+    video_paths: List[str] = []
 
     os.makedirs(traj_dir, exist_ok=True)
     traj_path = os.path.join(traj_dir, f"traj_step{step}.npz")
+    video_dir = os.path.join(traj_dir, "videos")
     all_eps = []
 
-    for _ in range(n_episodes):
+    for ep_idx in range(n_episodes):
         obs = env.reset()
         if isinstance(obs, tuple):
             obs = obs[0]
@@ -187,10 +231,18 @@ def _run_episodes(
         ep_ret = 0.0
         ep_len = 0
         ep_success = 0.0
+        should_record = record_video and ep_idx < video_episodes
+        frames: List[np.ndarray] = []
 
         for _ in range(max_steps):
             pobs = isaac_obs_to_policy_obs(obs, meta)
             tobs = {k: torch.as_tensor(v, device=device) for k, v in pobs.items()}
+
+            if should_record:
+                frame = _extract_wrist_frame(pobs)
+                if frame is not None:
+                    frames.append(frame)
+
             with torch.no_grad():
                 encoded = encoder(tobs)
                 action = actor.act(encoded, deterministic=True).detach().cpu().numpy().reshape(-1).astype(np.float32)
@@ -231,9 +283,14 @@ def _run_episodes(
         lengths.append(ep_len)
         all_eps.append(ep)
 
+        if should_record and frames:
+            vpath = os.path.join(video_dir, f"step{step}_ep{ep_idx}.mp4")
+            _save_video(frames, vpath, fps=video_fps)
+            video_paths.append(vpath)
+
     np.savez_compressed(traj_path, episodes=np.array(all_eps, dtype=object))
 
-    return {
+    result = {
         "return_mean": float(np.mean(returns)) if returns else float("nan"),
         "return_std": float(np.std(returns)) if returns else 0.0,
         "success_rate": float(np.mean(successes)) if successes else 0.0,
@@ -241,6 +298,9 @@ def _run_episodes(
         "n_episodes": len(returns),
         "trajectory_file": traj_path,
     }
+    if video_paths:
+        result["video_paths"] = video_paths
+    return result
 
 
 def main() -> None:
@@ -301,6 +361,9 @@ def main() -> None:
                         traj_dir=traj_dir,
                         step=step,
                         device=device,
+                        record_video=ARGS.record_video,
+                        video_fps=ARGS.video_fps,
+                        video_episodes=ARGS.video_episodes,
                     )
                 except Exception as e:
                     logger.warning("Rollout failed at step %d: %s", step, e)
@@ -317,6 +380,8 @@ def main() -> None:
                     int(stats["n_episodes"]),
                     stats["trajectory_file"],
                 )
+                if "video_paths" in stats:
+                    logger.info("[EVAL] Videos saved: %s", ", ".join(stats["video_paths"]))
 
                 eval_metrics = {f"evaluation/{k}": v for k, v in stats.items() if isinstance(v, (int, float, np.floating))}
                 wandb_log(wandb, eval_metrics, step=step)

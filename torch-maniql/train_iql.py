@@ -24,7 +24,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def normalize_rewards(dataset: ManiFeelDataset) -> None:
+def normalize_rewards(dataset: ManiFeelDataset, scale: float = 100.0) -> None:
     episode_returns = []
     cur = 0.0
     for i in range(dataset.size):
@@ -40,7 +40,9 @@ def normalize_rewards(dataset: ManiFeelDataset) -> None:
         print("[WARN] Flat returns, skipping normalisation.")
         return
     dataset.rewards /= ret_range
-    print(f"[INFO] Rewards normalised (range {ret_range:.4f} -> 1).")
+    dataset.rewards *= scale
+    print(f"[INFO] Rewards normalised (range {ret_range:.4f}, scale={scale:.0f}, "
+          f"effective reward range [{dataset.rewards.min():.4f}, {dataset.rewards.max():.4f}]).")
 
 
 @torch.no_grad()
@@ -130,6 +132,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test_ratio", type=float, default=0.1)
     p.add_argument("--tqdm", action="store_true", default=True)
     p.add_argument("--normalize_rewards", action="store_true", default=True)
+    p.add_argument("--reward_scale", type=float, default=100.0, help="Multiplier after return-range normalization.")
     p.add_argument("--clip_actions", action="store_true", default=True)
     p.add_argument("--validate", action="store_true", default=True)
     p.add_argument("--augment", action="store_true", default=True, help="DrQ-style random shift augmentation on images.")
@@ -183,8 +186,8 @@ def main() -> None:
         test_ds.validate()
 
     if args.normalize_rewards:
-        normalize_rewards(train_ds)
-        normalize_rewards(test_ds)
+        normalize_rewards(train_ds, scale=args.reward_scale)
+        normalize_rewards(test_ds, scale=args.reward_scale)
 
     obs_example = train_ds.observation_example()
     action_dim = int(train_ds.actions.shape[-1])
