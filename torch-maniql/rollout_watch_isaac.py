@@ -154,8 +154,8 @@ def _make_isaac_env():
             sim_device=cfg.sim_device,
             graphics_device_id=cfg.graphics_device_id,
             headless=cfg.headless,
-            virtual_screen_capture=False,
-            force_render=False,
+            virtual_screen_capture=True,
+            force_render=True,
         )
     return env
 
