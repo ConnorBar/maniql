@@ -44,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--seed", type=int, default=-1, help="Rollout seed (-1 = reuse training seed).")
     p.add_argument("--once", action="store_true", default=False)
+    p.add_argument("--train_cfg", default="", help="Hydra train config name override (e.g. TacSLTaskInsertionPPO_LSTM_dict_AAC).")
     p.add_argument("--traj_dir", default="", help="Where to write .npz trajectories (default: <save_dir>/trajectories).")
     p.add_argument("--record_video", action="store_true", default=False, help="Save wrist camera frames as MP4 videos.")
     p.add_argument("--video_fps", type=int, default=30, help="FPS for saved videos.")
@@ -103,16 +104,33 @@ def _await_meta(save_dir: str, poll_interval: int) -> dict:
 
 
 def _make_isaac_env():
+    from omegaconf import OmegaConf
     import isaacgymenvs  # noqa: F401
+    from isaacgymenvs.tasks import isaacgym_task_map
 
-    env = isaacgymenvs.make(
-        seed=int(ARGS.seed) if ARGS.seed >= 0 else 0,
-        task=ARGS.task,
-        num_envs=ARGS.num_envs,
-        sim_device=ARGS.sim_device,
+    cfg_dir = os.path.join(os.path.dirname(isaacgymenvs.__file__), "cfg", "task")
+    task_yaml = os.path.join(cfg_dir, f"{ARGS.task}.yaml")
+    if not os.path.isfile(task_yaml):
+        avail = [f.replace(".yaml", "") for f in os.listdir(cfg_dir) if f.endswith(".yaml")]
+        raise FileNotFoundError(
+            f"Task config not found: {task_yaml}\nAvailable tasks: {sorted(avail)}"
+        )
+
+    task_cfg = OmegaConf.load(task_yaml)
+    task_cfg = OmegaConf.to_container(task_cfg, resolve=True)
+
+    task_cfg["env"]["numEnvs"] = ARGS.num_envs
+    seed = int(ARGS.seed) if ARGS.seed >= 0 else 0
+    task_cfg.setdefault("seed", seed)
+
+    env = isaacgym_task_map[task_cfg["name"]](
+        cfg=task_cfg,
         rl_device=ARGS.rl_device,
+        sim_device=ARGS.sim_device,
         graphics_device_id=ARGS.graphics_device_id,
         headless=ARGS.headless,
+        virtual_screen_capture=False,
+        force_render=False,
     )
     return env
 
