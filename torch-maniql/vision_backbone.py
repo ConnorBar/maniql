@@ -73,6 +73,35 @@ def force_to_image(force: torch.Tensor) -> torch.Tensor:
     return x.permute(0, 2, 3, 1).contiguous()
 
 
+def random_shift_aug(images_bhwc: torch.Tensor, pad: int = 4) -> torch.Tensor:
+    """DrQ-style random shift augmentation for BHWC images.
+
+    Pads with replication, then takes a random crop back to the original size.
+    Each sample in the batch gets an independent random shift.
+
+    Returns float32 BHWC in [0, 1] range (ready for r3m_preprocess_bhwc).
+    """
+    b, h, w, c = images_bhwc.shape
+    x = images_bhwc.float()
+    if x.max() > 1.5:
+        x = x / 255.0
+    x = x.permute(0, 3, 1, 2)  # BCHW
+    x = F.pad(x, [pad] * 4, mode="replicate")
+    hp, wp = h + 2 * pad, w + 2 * pad
+    eps_h, eps_w = 1.0 / hp, 1.0 / wp
+    ar_h = torch.linspace(-1.0 + eps_h, 1.0 - eps_h, hp, device=x.device, dtype=x.dtype)[:h]
+    ar_w = torch.linspace(-1.0 + eps_w, 1.0 - eps_w, wp, device=x.device, dtype=x.dtype)[:w]
+    grid_w = ar_w.view(1, w).expand(h, w)
+    grid_h = ar_h.view(h, 1).expand(h, w)
+    base_grid = torch.stack([grid_w, grid_h], dim=-1).unsqueeze(0).expand(b, -1, -1, -1)
+    shift = torch.randint(0, 2 * pad + 1, (b, 1, 1, 2), device=x.device, dtype=x.dtype)
+    shift[..., 0] *= 2.0 / wp
+    shift[..., 1] *= 2.0 / hp
+    grid = base_grid + shift
+    out = F.grid_sample(x, grid, padding_mode="zeros", align_corners=False)
+    return out.permute(0, 2, 3, 1)  # BHWC float [0, 1]
+
+
 @dataclass(frozen=True)
 class R3MLoadResult:
     arch: str

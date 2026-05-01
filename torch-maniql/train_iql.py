@@ -40,8 +40,7 @@ def normalize_rewards(dataset: ManiFeelDataset) -> None:
         print("[WARN] Flat returns, skipping normalisation.")
         return
     dataset.rewards /= ret_range
-    dataset.rewards *= 1000.0
-    print(f"[INFO] Rewards normalised (range {ret_range:.4f} -> 1000).")
+    print(f"[INFO] Rewards normalised (range {ret_range:.4f} -> 1).")
 
 
 @torch.no_grad()
@@ -99,13 +98,17 @@ def save_checkpoint(agent: IQLLearner, save_dir: str, step: int) -> None:
     os.makedirs(ckpt_dir, exist_ok=True)
     payload = {
         "step": int(step),
+        "encoder": agent.encoder.state_dict(),
+        "target_encoder": agent.target_encoder.state_dict(),
         "actor": agent.actor.state_dict(),
         "critic": agent.critic.state_dict(),
         "value": agent.value.state_dict(),
         "target_critic": agent.target_critic.state_dict(),
+        "encoder_opt": agent.encoder_opt.state_dict(),
         "actor_opt": agent.actor_opt.state_dict(),
         "critic_opt": agent.critic_opt.state_dict(),
         "value_opt": agent.value_opt.state_dict(),
+        "schedulers": [s.state_dict() for s in agent.schedulers],
     }
     torch.save(payload, os.path.join(ckpt_dir, "checkpoint.pt"))
     with open(os.path.join(ckpt_dir, "DONE"), "w") as f:
@@ -126,9 +129,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_interval", type=int, default=50_000)
     p.add_argument("--test_ratio", type=float, default=0.1)
     p.add_argument("--tqdm", action="store_true", default=True)
-    p.add_argument("--normalize_rewards", action="store_true", default=False)
+    p.add_argument("--normalize_rewards", action="store_true", default=True)
     p.add_argument("--clip_actions", action="store_true", default=True)
     p.add_argument("--validate", action="store_true", default=True)
+    p.add_argument("--augment", action="store_true", default=True, help="DrQ-style random shift augmentation on images.")
+    p.add_argument("--aug_pad", type=int, default=4, help="Padding pixels for random shift augmentation.")
     # IQL hyperparams
     p.add_argument("--actor_lr", type=float, default=3e-4)
     p.add_argument("--critic_lr", type=float, default=3e-4)
@@ -137,7 +142,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--discount", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
     p.add_argument("--expectile", type=float, default=0.8)
-    p.add_argument("--temperature", type=float, default=0.1)
+    p.add_argument("--temperature", type=float, default=3.0)
+    p.add_argument("--backbone_lr", type=float, default=1e-5, help="LR for vision backbone (lower than head LRs).")
+    p.add_argument("--warmup_steps", type=int, default=1000, help="Linear LR warmup steps.")
+    p.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping.")
     # Logging / W&B
     p.add_argument("--wandb", action="store_true", default=False, help="Enable Weights & Biases logging.")
     p.add_argument("--wandb_project", default="torch-maniql")
@@ -196,6 +204,12 @@ def main() -> None:
         tau=args.tau,
         expectile=args.expectile,
         temperature=args.temperature,
+        augment=args.augment,
+        aug_pad=args.aug_pad,
+        backbone_lr=args.backbone_lr,
+        max_steps=args.max_steps,
+        warmup_steps=args.warmup_steps,
+        max_grad_norm=args.max_grad_norm,
     )
 
     meta_path = write_training_meta(
