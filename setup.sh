@@ -151,16 +151,30 @@ fi
 pip install -e .
 
 echo " Installing additional requirements..."
-# pip install -r blob/manifeel-tacff/isaacgymenvs/tacsl_sensors/install/requirements.txt
 pip install -r isaacgymenvs/tacsl_sensors/install/requirements.txt
+
+cd ..
+
+# -------------------------------
+# Install torch-maniql rollout deps
+# (torch + torchvision for model loading,
+#  imageio for video recording, wandb for logging)
+# -------------------------------
+echo " Installing PyTorch and rollout dependencies..."
+pip install torch==2.2.0+cu121 torchvision==0.17.0+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
+pip install numpy tqdm "pillow>=9.0.1" "imageio[ffmpeg]" wandb
 
 echo ""
 echo "======================================"
 echo " Setup complete!"
 echo "======================================"
-
-
-
-
-
+echo ""
+echo " To run rollouts:"
+echo "   conda activate tacsl"
+echo "   cd torch-maniql"
+echo "   python rollout_watch_isaac.py \\"
+echo "       --save_dir ./runs/manifeel_iql \\"
+echo "       --task TacSLTaskBulb --once --record_video"
+echo "======================================"
 

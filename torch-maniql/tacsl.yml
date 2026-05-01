@@ -6,13 +6,15 @@ channels:
 dependencies:
   - python=3.8
   - pip
-  # If you want a GPU-enabled torch build via conda on Linux, keep these.
-  # (On macOS, omit `pytorch-cuda`.)
+  - numpy
+  - tqdm
   - pytorch=2.2.0
   - torchvision=0.17.0
   - pytorch-cuda=12.1
+  - pillow>=9.0.1
+  - imageio<3
   - pip:
-      # From `manifeel-isaacgymenvs/setup.py` (isaacgymenvs install_requires)
+      # --- Isaac Gym / manifeel-isaacgymenvs deps ---
       - gym==0.23.1
       - omegaconf
       - termcolor
@@ -22,9 +24,10 @@ dependencies:
       - pyvirtualdisplay
       - urdfpy==0.0.22
       - pysdf==0.1.9
-      # setup.sh patches warp-lang 0.10.1 -> 0.11.0 (0.10.1 is broken)
       - warp-lang==0.11.0
       - trimesh==3.23.5
-      # From `manifeel-isaacgymenvs/.../tacsl_sensors/install/requirements.txt`
       - networkx==3.1
       - ray
+      # --- torch-maniql rollout deps ---
+      - wandb
+      - "imageio[ffmpeg]"
