@@ -17,7 +17,7 @@ cd "${SCRIPT_DIR}"
 
 python torch-maniql/rollout_watch_isaac.py \
     --save_dir ./runs/manifeel_iql \
-    --task TacSLTaskBulb \
+    --task TacSLTaskInsertion \
     --once \
     --record_video \
     "$@"
