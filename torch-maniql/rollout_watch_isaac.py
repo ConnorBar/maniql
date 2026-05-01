@@ -104,31 +104,43 @@ def _await_meta(save_dir: str, poll_interval: int) -> dict:
 
 
 def _make_isaac_env():
+    from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
     import isaacgymenvs  # noqa: F401
     from isaacgymenvs.tasks import isaacgym_task_map
+    from isaacgymenvs.utils.reformat import omegaconf_to_dict
 
-    cfg_dir = os.path.join(os.path.dirname(isaacgymenvs.__file__), "cfg", "task")
-    task_yaml = os.path.join(cfg_dir, f"{ARGS.task}.yaml")
-    if not os.path.isfile(task_yaml):
-        avail = [f.replace(".yaml", "") for f in os.listdir(cfg_dir) if f.endswith(".yaml")]
-        raise FileNotFoundError(
-            f"Task config not found: {task_yaml}\nAvailable tasks: {sorted(avail)}"
-        )
+    cfg_dir = os.path.join(os.path.dirname(isaacgymenvs.__file__), "cfg")
 
-    task_cfg = OmegaConf.load(task_yaml)
-    task_cfg = OmegaConf.to_container(task_cfg, resolve=True)
+    # Find any available train config — we don't use it, but hydra requires one.
+    train_cfg = ARGS.train_cfg
+    if not train_cfg:
+        train_dir = os.path.join(cfg_dir, "train")
+        avail = [f.replace(".yaml", "") for f in os.listdir(train_dir) if f.endswith(".yaml")]
+        train_cfg = avail[0] if avail else "AntPPO"
 
-    task_cfg["env"]["numEnvs"] = ARGS.num_envs
-    seed = int(ARGS.seed) if ARGS.seed >= 0 else 0
-    task_cfg.setdefault("seed", seed)
+    overrides = [
+        f"task={ARGS.task}",
+        f"train={train_cfg}",
+        f"num_envs={ARGS.num_envs}",
+        f"seed={int(ARGS.seed) if ARGS.seed >= 0 else 0}",
+        f"sim_device={ARGS.sim_device}",
+        f"rl_device={ARGS.rl_device}",
+        f"graphics_device_id={ARGS.graphics_device_id}",
+        f"headless={ARGS.headless}",
+    ]
+
+    with initialize_config_dir(config_dir=cfg_dir):
+        cfg = compose(config_name="config", overrides=overrides)
+
+    task_cfg = omegaconf_to_dict(cfg.task)
 
     env = isaacgym_task_map[task_cfg["name"]](
         cfg=task_cfg,
-        rl_device=ARGS.rl_device,
-        sim_device=ARGS.sim_device,
-        graphics_device_id=ARGS.graphics_device_id,
-        headless=ARGS.headless,
+        rl_device=cfg.rl_device,
+        sim_device=cfg.sim_device,
+        graphics_device_id=cfg.graphics_device_id,
+        headless=cfg.headless,
         virtual_screen_capture=False,
         force_render=False,
     )
