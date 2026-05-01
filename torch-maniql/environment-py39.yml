@@ -1,0 +1,24 @@
+name: torch-maniql
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  # NumPy 2.x is required — the preprocessed pickles reference numpy._core
+  # (a 2.x internal package) and segfault on 1.x even with the sys.modules hack.
+  # PyTorch 2.3+ has first-class NumPy 2.0 support; 2.2 predates the 2.0 release.
+  - numpy>=2.0,<3
+  - tqdm
+  # PyTorch 2.3.1 + torchvision 0.18.1 support Python 3.9, CUDA 12.1, NumPy 2.x.
+  # RTX 4090 (Ada Lovelace, sm_89) is fully covered by CUDA 12.1.
+  - pytorch=2.3.1
+  - torchvision=0.18.1
+  - pytorch-cuda=12.1
+  - pillow>=9.0.1
+  - imageio<3
+  - pip:
+      - wandb
+      - gdown>=4.4.0
+      - -e ./r3m

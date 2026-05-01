@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: r3m
 Version: 0.0.0
 Summary: R3M: Pretrained Reusable Representations for Robot Manipulation from Diverse Human Videos
@@ -10,6 +10,11 @@ Requires-Dist: torchvision>=0.8.2
 Requires-Dist: omegaconf>=2.1.1
 Requires-Dist: hydra-core>=1.1.1
 Requires-Dist: pillow>=9.0.1
+Dynamic: author
+Dynamic: description
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary
 
 # R3M: A Universal Visual Representation for Robot Manipulation
 

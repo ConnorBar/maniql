@@ -15,7 +15,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 
-from multimodal_nets import DiagGaussianPolicy
+from multimodal_nets import MultiModalEncoder, PolicyHead, encoded_obs_dim
 from log_utils import init_wandb, setup_logging, wandb_log, write_jsonl
 
 
@@ -135,24 +135,30 @@ def isaac_obs_to_policy_obs(raw, meta: dict) -> Dict[str, np.ndarray]:
     raise TypeError("Isaac obs is not a dict and multiple obs keys are expected.")
 
 
-def _load_actor(meta: dict, checkpoint_dir: str, device: torch.device) -> DiagGaussianPolicy:
+def _load_actor(meta: dict, checkpoint_dir: str, device: torch.device) -> Tuple[MultiModalEncoder, PolicyHead]:
     ckpt_path = os.path.join(checkpoint_dir, "checkpoint.pt")
     payload = torch.load(ckpt_path, map_location="cpu")
-    actor_sd = payload["actor"]
-    actor = DiagGaussianPolicy(
-        arch=meta["arch"],
-        mode=meta["mode"],
+    arch = meta["arch"]
+    mode = meta["mode"]
+    obs_dim = encoded_obs_dim(arch, mode)
+
+    encoder = MultiModalEncoder(arch=arch, mode=mode, r3m_checkpoint=None).to(device)
+    encoder.load_state_dict(payload["encoder"], strict=True)
+    encoder.eval()
+
+    actor = PolicyHead(
+        obs_dim=obs_dim,
         hidden_dims=tuple(meta["hidden_dims"]),
         action_dim=int(meta["action_dim"]),
-        r3m_checkpoint=None,
     ).to(device)
-    actor.load_state_dict(actor_sd, strict=True)
+    actor.load_state_dict(payload["actor"], strict=True)
     actor.eval()
-    return actor
+    return encoder, actor
 
 
 def _run_episodes(
-    actor: DiagGaussianPolicy,
+    encoder: MultiModalEncoder,
+    actor: PolicyHead,
     env,
     meta: dict,
     n_episodes: int,
@@ -186,7 +192,8 @@ def _run_episodes(
             pobs = isaac_obs_to_policy_obs(obs, meta)
             tobs = {k: torch.as_tensor(v, device=device) for k, v in pobs.items()}
             with torch.no_grad():
-                action = actor.act(tobs, deterministic=True).detach().cpu().numpy().reshape(-1).astype(np.float32)
+                encoded = encoder(tobs)
+                action = actor.act(encoded, deterministic=True).detach().cpu().numpy().reshape(-1).astype(np.float32)
 
             act_t = torch.from_numpy(np.tile(action[None, :], (ARGS.num_envs, 1))).to(ARGS.rl_device)
             step_out = env.step(act_t)
@@ -277,7 +284,7 @@ def main() -> None:
             for step, path in new:
                 logger.info("[EVAL] step=%d checkpoint=%s", step, path)
                 try:
-                    actor = _load_actor(meta, path, device=device)
+                    encoder, actor = _load_actor(meta, path, device=device)
                 except Exception as e:
                     logger.warning("Failed to load checkpoint %s: %s", path, e)
                     seen.add(step)
@@ -285,6 +292,7 @@ def main() -> None:
 
                 try:
                     stats = _run_episodes(
+                        encoder,
                         actor,
                         env,
                         meta,

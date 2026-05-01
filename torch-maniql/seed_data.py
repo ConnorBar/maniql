@@ -70,6 +70,9 @@ def parse_args():
                    help="Flush a chunk every N input files.")
     p.add_argument("--chunk-dir", type=str, default="")
     p.add_argument("--keep-chunks", action="store_true")
+    p.add_argument("--normalize-actions", action="store_true", default=True,
+                   help="Normalize actions to [-1, 1] per dimension using "
+                        "max absolute value from the data.")
     return p.parse_args()
 
 
@@ -237,8 +240,30 @@ def _empty_buffers(split_keys):
     }
 
 
+def normalize_actions(actions: np.ndarray) -> np.ndarray:
+    """Normalize each action dimension to [-1, 1] by its max absolute value.
+
+    Dimensions that are already within [-1, 1] are left untouched.
+    Dimensions that are constant (std=0) are left as-is.
+    """
+    n_dims = actions.shape[1]
+    scales = np.ones(n_dims, dtype=np.float32)
+    for d in range(n_dims):
+        max_abs = np.max(np.abs(actions[:, d]))
+        if max_abs > 1.0:
+            scales[d] = max_abs
+    print(f"[INFO] Action normalization scales: {scales.tolist()}")
+    for d in range(n_dims):
+        if scales[d] > 1.0:
+            print(f"  dim {d}: range [{actions[:, d].min():.4f}, "
+                  f"{actions[:, d].max():.4f}] -> "
+                  f"[{actions[:, d].min() / scales[d]:.4f}, "
+                  f"{actions[:, d].max() / scales[d]:.4f}]")
+    return actions / scales[None, :]
+
+
 def merge_chunks(chunk_dir: Path, output_path: Path, metadata: dict,
-                 split_keys):
+                 split_keys, normalize_acts: bool = False):
     chunk_files = sorted(chunk_dir.glob("chunk_*.pkl"))
     if not chunk_files:
         raise RuntimeError(f"No chunk files in {chunk_dir}")
@@ -283,12 +308,19 @@ def merge_chunks(chunk_dir: Path, output_path: Path, metadata: dict,
         })
         cursor += n
 
+    all_actions = np.concatenate(scalar_arrs["actions"])
+    if normalize_acts:
+        all_actions = normalize_actions(all_actions)
+        metadata["action_normalization"] = "per_dim_max_abs"
+
     final = {
         "metadata": metadata,
         "file_index": file_index,
         "obs": {k: np.concatenate(obs_arrs[k]) for k in split_keys},
         "next_obs": {k: np.concatenate(nobs_arrs[k]) for k in split_keys},
-        **{sk: np.concatenate(scalar_arrs[sk]) for sk in scalar_arrs},
+        "actions": all_actions.astype(np.float32),
+        **{sk: np.concatenate(scalar_arrs[sk]) for sk in scalar_arrs
+           if sk != "actions"},
         "terminals": np.clip(
             np.concatenate(scalar_arrs["dones"])
             - np.concatenate(scalar_arrs["timeouts"]),
@@ -373,7 +405,8 @@ def main():
         "seed_start": int(args.seed_start),
         "file_sort": "filename ascending",
     }
-    merge_chunks(chunk_dir, output_path, metadata, split_keys)
+    merge_chunks(chunk_dir, output_path, metadata, split_keys,
+                 normalize_acts=args.normalize_actions)
 
     if not args.keep_chunks:
         shutil.rmtree(chunk_dir, ignore_errors=True)
