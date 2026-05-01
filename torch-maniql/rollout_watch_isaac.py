@@ -18,6 +18,12 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+# Isaac Gym MUST be imported before torch. We do the isaacgym import here at
+# the top level so that it initialises before any torch import.  The actual
+# env creation still happens lazily in _make_isaac_env().
+import isaacgym  # noqa: F401
+
 import torch
 
 from multimodal_nets import MultiModalEncoder, PolicyHead, encoded_obs_dim
