@@ -140,9 +140,14 @@ def _make_isaac_env():
         task_cfg["env"].setdefault("obsDims", {})
         if "wrist" not in task_cfg["env"]["obsDims"]:
             task_cfg["env"]["obsDims"]["wrist"] = [96, 96, 3]
-        task_cfg["env"]["use_camera"] = True
+        #task_cfg["env"]["use_camera"] = True
+        #task_cfg["env"]["use_camera_obs"] = True
+        #task_cfg["env"]["enableCameraSensors"] = True
+        task_cfg["env"]["use_isaac_gym_tactile"] = False
+        task_cfg["env"]["use_shear_force"] = False
+        task_cfg["env"]["use_camera"] = True        # keep wrist camera
         task_cfg["env"]["use_camera_obs"] = True
-        task_cfg["env"]["enableCameraSensors"] = True
+        task_cfg["env"]["use_gelsight"] = False
         # Ensure camera_configs has a wrist camera at the right resolution
         cam_cfgs = task_cfg["env"].get("camera_configs", [])
         wrist_found = False

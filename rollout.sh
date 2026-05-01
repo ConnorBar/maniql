@@ -14,10 +14,14 @@ export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${ISAAC_DIR}/isaacgym/python/isaacgy
 export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
 
 cd "${SCRIPT_DIR}"
+#xvfb-run -a python torch-maniql/rollout_watch_isaac.py \
+#      --save_dir ./runs/manifeel_iql \
+#      --task TacSLTaskBulb \
+#      --once
 
-python torch-maniql/rollout_watch_isaac.py \
-    --save_dir ./runs/manifeel_iql \
-    --task TacSLTaskBulb \
-    --once \
-    --record_video \
-    "$@"
+xvfb-run -a python torch-maniql/rollout_watch_isaac.py \
+      --save_dir ./runs/manifeel_iql \
+      --task TacSLTaskBulb \
+      --once \
+      --num_envs 1 \
+      --graphics_device_id 0
