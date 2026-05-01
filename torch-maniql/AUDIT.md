@@ -4,13 +4,47 @@ Holistic review of the offline IQL pipeline: algorithm correctness, data pipelin
 architecture, regularization, and training dynamics.
 
 **Dataset context:** 40 human demonstration episodes (~36 train / ~4 test),
-224x224x3 wrist camera + 7-dim state, 7-dim continuous actions, sparse rewards.
+224x224x3 wrist camera + 7-dim state, 7-dim continuous actions.
+
+**Measured dataset stats** (from `raw_wrist_state.pkl`):
+- 31,797 transitions, 40 episodes, ep_len mean=795 median=790 min=556 max=1224
+- Rewards: DENSE negative distance-to-goal, range [-0.20, -0.004], mean=-0.021
+- Episode returns: [-23.17, -11.47], mean=-16.38, std=2.94
+- Success flag: always 0 (data collection bug — demos ARE successful, reward converges to ~0)
+- Timeouts: 0 for all episodes (dones == terminals in this dataset)
+- Task: TacSLTaskBulb (precision screw insertion), numActions=7
 
 NOTE: we are looking primarily only using the wrist camera and the state, not the full feature set that we see in the one example file.
 
 ---
 
 ## Bugs
+
+### B0. Action space mismatch — raw teleop actions not normalized (CRITICAL)
+- **File:** `seed_data.py` (data preprocessing)
+- **Severity:** CRITICAL — training on wrong action labels
+- **Issue:** The IsaacGym sim expects normalized [-1, 1] actions. Raw demo actions were
+  recorded in physical/raw units:
+  - Dims 0-2 (position): roughly [-1.5, 1.5] — close to correct
+  - Dims 3-4 (roll/pitch): always 0 — correct (axes not used in teleop)
+  - **Dim 5 (wrist rotation): raw ±8.25** — 165x over expected range. After
+    `clip_actions=True`, every sample is saturated at ±1, destroying all magnitude
+    variation. For a SCREW INSERTION task, rotation is the most critical dimension.
+  - Dim 6 (gripper): [0, 0.035] — raw finger width in meters, also wrong-scale
+  The policy trains on corrupted action labels for its most important dimension.
+- **Fix:** In `seed_data.py`, divide raw actions by the sim's action scales before storing:
+  ```
+  pos_action_scale = [0.01, 0.01, 0.01]   (dims 0-2)
+  rot_action_scale = [0.05, 0.05, 0.05]   (dims 3-5)
+  gripper_scale    = TBD                    (dim 6 — needs lab confirmation)
+  actions = raw_actions / action_scales
+  ```
+  Then let `clip_actions=True` in the dataset loader handle final clamping to [-1+eps, 1-eps].
+  **Requires re-running `seed_data.py` to regenerate the preprocessed pickle.**
+- **Status:** [x] DONE — `seed_data.py` now has `--normalize-actions` (default on).
+  Per-dimension max-abs normalization scales any dimension outside [-1, 1] into range.
+  Dim 6 (gripper) is unused by the sim (commented out in tacsl_task_bulb.py) so left as-is.
+  **Must re-run `seed_data.py` to regenerate the preprocessed pickle.**
 
 ### B1. Terminal/timeout masking uses `dones` instead of `terminals`
 - **File:** `manifeel_iql.py:61`
@@ -21,7 +55,8 @@ NOTE: we are looking primarily only using the wrist camera and the state, not th
   `mask=0`, telling the critic the future value is zero — biasing V downward for
   late-episode states and creating an artificial value cliff near the time horizon.
 - **Fix:** `self.masks = 1.0 - data["terminals"].astype(np.float32)`
-- **Status:** [ ] TODO
+- **Status:** [ ] TODO (moot for current dataset — timeouts=0, so dones==terminals.
+  Still a correctness fix for future datasets.)
 
 ### B2. Reward normalization scale (x1000) causes advantage saturation
 - **File:** `train_iql.py:36-42`
@@ -35,13 +70,13 @@ NOTE: we are looking primarily only using the wrist camera and the state, not th
   Adjust temperature upward (3.0–10.0) to compensate.
 - **Status:** [x] DONE — removed x1000 multiplier; rewards now normalized to unit range.
 
-### B3. Default temperature=0.1 with sparse rewards disables IQL advantage weighting
+### B3. Default temperature=0.1 too low for meaningful advantage weighting
 - **File:** `train_iql.py` (default args)
 - **Severity:** High (design)
-- **Issue:** With sparse rewards (mostly 0, occasionally 1) and no normalization,
-  advantages are small. `exp(small * 0.1) ≈ 1.0` for all transitions, reducing
-  the actor update to unweighted MLE — pure behavioral cloning. IQL's entire edge
-  over BC comes from advantage weighting, and this setting disables it.
+- **Issue:** With dense rewards in [-0.20, -0.004] and no normalization, advantages
+  are small. `exp(small * 0.1) ≈ 1.0` for all transitions, reducing the actor
+  update to unweighted MLE — pure behavioral cloning. IQL's entire edge over BC
+  comes from advantage weighting, and this setting disables it.
 - **Fix:** Enable reward normalization (fixed per B2) and increase temperature to
   3.0–10.0 so the weighting has dynamic range.
 - **Status:** [x] DONE — default temperature changed from 0.1 to 3.0; normalize_rewards
@@ -177,14 +212,15 @@ NOTE: we are looking primarily only using the wrist camera and the state, not th
 
 ## Priority Order for Implementation
 
-| Priority  | Item                              | Impact     | Effort  | Done |
-|-----------|-----------------------------------|------------|---------|------|
-| 1 | A1    — Shared encoder                    | High       | Medium  |  X   |
-| 2 | B3+B2 — Fix rewards + temperature         | High       | Low     |  X   |
-| 3 | R1    — Image augmentation + weight decay | High       | Low     |  X   |
-| 4 | B1    — Terminal/timeout masking          | Medium     | Trivial |      |
-| 5 | R2    — Gradient clipping                 | Medium     | Trivial |  X   |
-| 6 | A2    — Force MLP (full mode only)        | Low-Medium | Low     |      |
-| 7 | R3    — LR scheduling                     | Low-Medium | Low     |  X   |
-| 8 | E2    — Better grad tracking              | Low        | Trivial |      |
-| 9 | D1    — Done-signal validation            | Low        | Trivial |      |
+| Priority  | Item                              | Impact     | Effort   | Status |
+|-----------|-----------------------------------|------------|----------|--------|
+| **1** | **B0 — Action space normalization**   | **CRITICAL** | **Medium** | **DONE — re-run seed_data.py** |
+| 2 | A1    — Shared encoder                    | High       | Medium   |  DONE  |
+| 3 | B3+B2 — Fix rewards + temperature         | High       | Low      |  DONE  |
+| 4 | R1    — Image augmentation + weight decay | High       | Low      |  DONE (partial) |
+| 5 | R2    — Gradient clipping                 | Medium     | Trivial  |  DONE  |
+| 6 | R3    — LR scheduling + differential LR   | Low-Medium | Low      |  DONE  |
+| 7 | B1    — Terminal/timeout masking          | Medium     | Trivial  |  moot (timeouts=0) |
+| 8 | A2    — Force MLP (full mode only)        | Low-Medium | Low      |        |
+| 9 | E2    — Better grad tracking              | Low        | Trivial  |        |
+| 10 | D1   — Done-signal validation            | Low        | Trivial  |        |
