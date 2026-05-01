@@ -133,17 +133,30 @@ def _make_isaac_env():
     with initialize_config_dir(config_dir=cfg_dir):
         cfg = compose(config_name="config", overrides=overrides)
 
-    task_cfg = omegaconf_to_dict(cfg.task)
+        task_cfg = omegaconf_to_dict(cfg.task)
 
-    env = isaacgym_task_map[task_cfg["name"]](
-        cfg=task_cfg,
-        rl_device=cfg.rl_device,
-        sim_device=cfg.sim_device,
-        graphics_device_id=cfg.graphics_device_id,
-        headless=cfg.headless,
-        virtual_screen_capture=False,
-        force_render=False,
-    )
+        task_name = task_cfg["name"]
+        if task_name not in isaacgym_task_map:
+            for registered in isaacgym_task_map:
+                if task_name.lower() in registered.lower() or registered.lower() in task_name.lower():
+                    print(f"[INFO] Task '{task_name}' not in task_map, using '{registered}'")
+                    task_name = registered
+                    break
+            else:
+                raise KeyError(
+                    f"Task '{task_name}' not found in isaacgym_task_map. "
+                    f"Available: {sorted(isaacgym_task_map.keys())}"
+                )
+
+        env = isaacgym_task_map[task_name](
+            cfg=task_cfg,
+            rl_device=cfg.rl_device,
+            sim_device=cfg.sim_device,
+            graphics_device_id=cfg.graphics_device_id,
+            headless=cfg.headless,
+            virtual_screen_capture=False,
+            force_render=False,
+        )
     return env
 
 
