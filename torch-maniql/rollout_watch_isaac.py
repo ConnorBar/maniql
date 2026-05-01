@@ -89,6 +89,15 @@ def _await_meta(save_dir: str, poll_interval: int) -> dict:
 
 
 def _make_isaac_env():
+    # IsaacGym must be imported before torch in many setups. If isaacgym
+    # was already imported at module level (e.g. via isaacgymenvs) this
+    # is a no-op; otherwise it ensures the GPU context is initialized
+    # before any torch CUDA calls.
+    try:
+        import isaacgym  # noqa: F401
+    except ImportError:
+        pass
+
     import isaacgymenvs  # noqa: F401
 
     env = isaacgymenvs.make(
@@ -104,35 +113,66 @@ def _make_isaac_env():
 
 
 def isaac_obs_to_policy_obs(raw, meta: dict) -> Dict[str, np.ndarray]:
+    """Map IsaacGym env observations to the policy's expected format.
+
+    The env returns a dict with keys like 'ee_pos' (3), 'ee_quat' (4),
+    'wrist' (96x96x3), etc.  The policy expects 'wrist' (224x224x3) and
+    'state' (7) — where state = concat(ee_pos, ee_quat).
+    """
+    from PIL import Image as _PILImage
+
     def _to_np(x):
         if isinstance(x, torch.Tensor):
             return x.detach().cpu().numpy()
         return np.asarray(x)
 
-    want_keys = list(meta["obs_shapes"].keys())
+    if not isinstance(raw, dict):
+        raise TypeError(
+            f"Expected dict observations from the env, got {type(raw)}. "
+            f"Make sure the task config has use_dict_obs: True."
+        )
 
-    if isinstance(raw, dict):
-        out = {}
-        for k in want_keys:
-            if k not in raw:
-                raise KeyError(
-                    f"Isaac obs missing key {k!r}; got {list(raw.keys())}. "
-                    f"Edit isaac_obs_to_policy_obs() for this task."
-                )
+    want_keys = list(meta["obs_shapes"].keys())
+    out: Dict[str, np.ndarray] = {}
+
+    for k in want_keys:
+        if k == "state":
+            ee_pos = _to_np(raw["ee_pos"]).reshape(-1, 3)
+            ee_quat = _to_np(raw["ee_quat"]).reshape(-1, 4)
+            state = np.concatenate([ee_pos, ee_quat], axis=-1).astype(np.float32)
+            if state.shape[0] == 1:
+                state = state[0:1]
+            out["state"] = state
+        elif k == "wrist":
+            wrist = _to_np(raw["wrist"])
+            if wrist.ndim == 3:
+                wrist = wrist[None, ...]
+            target_h, target_w = meta["obs_shapes"]["wrist"][:2]
+            if wrist.shape[1] != target_h or wrist.shape[2] != target_w:
+                resized = []
+                for i in range(wrist.shape[0]):
+                    img = wrist[i]
+                    if img.dtype != np.uint8:
+                        if img.max() <= 1.5:
+                            img = (img * 255.0).clip(0, 255).astype(np.uint8)
+                        else:
+                            img = img.clip(0, 255).astype(np.uint8)
+                    pil = _PILImage.fromarray(img)
+                    pil = pil.resize((target_w, target_h), _PILImage.BILINEAR)
+                    resized.append(np.asarray(pil, dtype=np.uint8))
+                wrist = np.stack(resized)
+            out["wrist"] = wrist.astype(np.dtype(meta["obs_dtypes"]["wrist"]), copy=False)
+        elif k in raw:
             arr = _to_np(raw[k])
             if arr.ndim == len(meta["obs_shapes"][k]) - 1:
                 arr = arr[None, ...]
             out[k] = arr.astype(np.dtype(meta["obs_dtypes"][k]), copy=False)
-        return out
-
-    arr = _to_np(raw)
-    if len(want_keys) == 1:
-        k = want_keys[0]
-        if arr.ndim == len(meta["obs_shapes"][k]) - 1:
-            arr = arr[None, ...]
-        return {k: arr.astype(np.dtype(meta["obs_dtypes"][k]), copy=False)}
-
-    raise TypeError("Isaac obs is not a dict and multiple obs keys are expected.")
+        else:
+            raise KeyError(
+                f"Policy expects obs key {k!r} but env returned {sorted(raw.keys())}. "
+                f"Update isaac_obs_to_policy_obs() for this task."
+            )
+    return out
 
 
 def _load_actor(meta: dict, checkpoint_dir: str, device: torch.device) -> Tuple[MultiModalEncoder, PolicyHead]:
@@ -180,7 +220,7 @@ def _run_episodes(
         obs = env.reset()
         if isinstance(obs, tuple):
             obs = obs[0]
-        if isinstance(obs, dict) and "obs" in obs and len(obs) == 1:
+        if isinstance(obs, dict) and "obs" in obs:
             obs = obs["obs"]
 
         ep = {"obs": [], "action": [], "reward": [], "done": []}
@@ -204,7 +244,7 @@ def _run_episodes(
             else:
                 obs, reward, done_t, info = step_out
 
-            if isinstance(obs, dict) and "obs" in obs and len(obs) == 1:
+            if isinstance(obs, dict) and "obs" in obs:
                 obs = obs["obs"]
 
             r = float(np.asarray(reward).reshape(-1)[0])
