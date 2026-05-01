@@ -166,11 +166,21 @@ def _make_isaac_env():
 
         task_name = task_cfg["name"]
         if task_name not in isaacgym_task_map:
+            # TacSL tasks all use the same base class; map any TacSL variant
+            # to the registered TacSLTaskInsertion entry.
+            matched = None
             for registered in isaacgym_task_map:
                 if task_name.lower() in registered.lower() or registered.lower() in task_name.lower():
-                    print(f"[INFO] Task '{task_name}' not in task_map, using '{registered}'")
-                    task_name = registered
+                    matched = registered
                     break
+            if matched is None and "tacsl" in task_name.lower():
+                for registered in isaacgym_task_map:
+                    if "tacsl" in registered.lower():
+                        matched = registered
+                        break
+            if matched:
+                print(f"[INFO] Task '{task_name}' not in task_map, using '{matched}'")
+                task_name = matched
             else:
                 raise KeyError(
                     f"Task '{task_name}' not found in isaacgym_task_map. "
