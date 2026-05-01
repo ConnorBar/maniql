@@ -135,6 +135,35 @@ def _make_isaac_env():
 
         task_cfg = omegaconf_to_dict(cfg.task)
 
+        # Force-enable wrist camera regardless of which YAML was resolved.
+        # The policy was trained on 96x96 wrist images; ensure the env provides them.
+        task_cfg["env"].setdefault("obsDims", {})
+        if "wrist" not in task_cfg["env"]["obsDims"]:
+            task_cfg["env"]["obsDims"]["wrist"] = [96, 96, 3]
+        task_cfg["env"]["use_camera"] = True
+        task_cfg["env"]["use_camera_obs"] = True
+        task_cfg["env"]["enableCameraSensors"] = True
+        # Ensure camera_configs has a wrist camera at the right resolution
+        cam_cfgs = task_cfg["env"].get("camera_configs", [])
+        wrist_found = False
+        for c in cam_cfgs:
+            if c.get("name") == "wrist":
+                c["image_size"] = [96, 96]
+                wrist_found = True
+                break
+        if not wrist_found:
+            cam_cfgs.append({
+                "name": "wrist",
+                "is_body_camera": True,
+                "actor_name": "franka",
+                "attach_link_name": "panda_hand",
+                "image_size": [96, 96],
+                "image_type": "rgb",
+                "horizontal_fov": 75.0,
+                "camera_pose": [[0.045, 0, 0.04], [0.5, 0, 0.866, 0]],
+            })
+        task_cfg["env"]["camera_configs"] = cam_cfgs
+
         task_name = task_cfg["name"]
         if task_name not in isaacgym_task_map:
             for registered in isaacgym_task_map:
@@ -171,12 +200,29 @@ def isaac_obs_to_policy_obs(raw, meta: dict) -> Dict[str, np.ndarray]:
     if isinstance(raw, dict):
         out = {}
         for k in want_keys:
-            if k not in raw:
+            if k in raw:
+                arr = _to_np(raw[k])
+            elif k == "state":
+                # Construct state vector from individual Isaac obs components.
+                # Training data state = ee_pos(3) + ee_quat(4) = 7 dims.
+                parts = []
+                for sk in ("ee_pos", "ee_quat", "socket_pos", "socket_quat"):
+                    if sk in raw:
+                        parts.append(_to_np(raw[sk]))
+                if not parts:
+                    raise KeyError(
+                        f"Cannot construct 'state' from Isaac obs; "
+                        f"got keys {list(raw.keys())}."
+                    )
+                arr = np.concatenate(parts, axis=-1)
+                # Trim to expected state dim (policy may only use first N dims)
+                expected_state_dim = meta["obs_shapes"][k][-1]
+                arr = arr[..., :expected_state_dim]
+            else:
                 raise KeyError(
                     f"Isaac obs missing key {k!r}; got {list(raw.keys())}. "
                     f"Edit isaac_obs_to_policy_obs() for this task."
                 )
-            arr = _to_np(raw[k])
             if arr.ndim == len(meta["obs_shapes"][k]) - 1:
                 arr = arr[None, ...]
             out[k] = arr.astype(np.dtype(meta["obs_dtypes"][k]), copy=False)
